@@ -48,6 +48,7 @@
         import { getFirestore, collection, addDoc, setDoc, updateDoc, query, orderBy, onSnapshot, serverTimestamp, where, deleteDoc, doc, getDoc } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
         import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-storage.js";
 
+        // --- CONFIGURATION ---
         const firebaseConfig = {
             apiKey: "AIzaSyCYDzlPnsMvnhrHvM4YQLMQCM5RAbrKLYE",
             authDomain: "reporting-tsa-2026.firebaseapp.com",
@@ -63,22 +64,371 @@
         const db = getFirestore(app);
         const storage = getStorage(app);
         
+        // --- STATE GLOBAL ---
         let currentUser = null;
         let currentUserProfile = null;
+        
         let reportingsCache = [];
         let filteredReportings = [];
+        let weeklyReportsCache = [];
         let campingsCache = [];
         let usersCache = [];
         let notificationsCache = [];
         
-        // Listeners
+        // Listeners Cleanup
         let unsubProfile = null;
         let unsubReportings = null;
         let unsubUsers = null;
         let unsubCampings = null;
         let unsubNotifs = null;
+        let unsubWeekly = null;
 
         let charts = {};
+        let hebdoViewMode = 'grid';
+
+        // --- 1. FONCTIONS DE NAVIGATION & UI (Globales) ---
+
+        window.showApp = function() {
+            document.getElementById('view-auth').classList.add('hidden');
+            document.getElementById('view-app').classList.remove('hidden');
+            window.switchTab('dashboard');
+        }
+
+        window.showAuth = function() {
+            document.getElementById('view-auth').classList.remove('hidden');
+            document.getElementById('view-app').classList.add('hidden');
+        }
+
+        window.switchTab = function(tabId) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+            document.getElementById('tab-' + tabId).classList.remove('hidden');
+            
+            const navLinks = document.querySelectorAll('.nav-link');
+            navLinks.forEach(l => {
+                const isActive = l.dataset.target === tabId;
+                l.classList.toggle('text-tsa-red', isActive);
+                l.classList.toggle('text-slate-400', !isActive);
+            });
+            
+            if(tabId === 'stats') {
+                if(filteredReportings.length === 0 && reportingsCache.length > 0) {
+                     filteredReportings = [...reportingsCache];
+                }
+                setTimeout(renderStats, 100);
+            }
+            if(tabId === 'hebdo') calculateHebdoStats();
+        }
+
+        window.openModal = function(id) {
+            document.getElementById(id).classList.remove('hidden');
+            if(id === 'modal-reporting') {
+                const d = document.getElementById('rp-date');
+                if(d) d.valueAsDate = new Date();
+                // Pre-selection camping
+                const cSelect = document.getElementById('rp-camping');
+                if (cSelect && currentUserProfile) cSelect.value = currentUserProfile.camping;
+            }
+        }
+
+        window.closeModal = function(id) {
+            document.getElementById(id).classList.add('hidden');
+        }
+
+        window.changeParticipants = function(d) {
+            const i = document.getElementById('rp-participants');
+            if(i) i.value = Math.max(0, (parseInt(i.value)||0) + d);
+        }
+
+        window.toggleAccordion = function(id) {
+            const el = document.getElementById(id);
+            if(el) el.classList.toggle('hidden');
+        }
+
+        window.toggleAuthMode = function() {
+            document.getElementById('form-login').classList.toggle('hidden');
+            document.getElementById('form-register').classList.toggle('hidden');
+        }
+
+        window.toggleNotifPanel = function() {
+            document.getElementById('notif-panel').classList.toggle('hidden');
+        }
+
+        window.toggleChip = function(el) {
+            if (el.classList.contains('selected')) {
+                el.classList.remove('selected', 'bg-tsa-red', 'text-white', 'border-transparent');
+                el.classList.add('bg-white', 'text-slate-600', 'border-slate-200');
+            } else {
+                el.classList.add('selected', 'bg-tsa-red', 'text-white', 'border-transparent');
+                el.classList.remove('bg-white', 'text-slate-600', 'border-slate-200');
+            }
+        }
+
+        // --- UI HELPERS INTERNAL ---
+
+        function updateProfileUI() { 
+            if(currentUserProfile) {
+                const elName = document.getElementById('user-name-display');
+                if(elName) elName.innerText = currentUserProfile.displayName;
+                const elCamp = document.getElementById('user-camping-display');
+                if(elCamp) elCamp.innerText = currentUserProfile.camping;
+                
+                const pName = document.getElementById('prof-name');
+                if(pName) pName.value = currentUserProfile.displayName || '';
+                const pEmail = document.getElementById('prof-email');
+                if(pEmail) pEmail.value = currentUserProfile.email || '';
+                const pRole = document.getElementById('prof-role');
+                if(pRole) pRole.innerText = (currentUserProfile.role || '').toUpperCase();
+                
+                const pCamp = document.getElementById('prof-camping');
+                if(pCamp) {
+                    pCamp.value = currentUserProfile.camping;
+                    pCamp.disabled = !['admin', 'coordinateur'].includes(currentUserProfile.role);
+                }
+
+                const imgUrl = currentUserProfile.photoURL || `https://ui-avatars.com/api/?name=${currentUserProfile.displayName}&background=random`;
+                const imgPrev = document.getElementById('prof-img-preview');
+                if(imgPrev) imgPrev.src = imgUrl;
+            }
+        }
+
+        function updateNavBasedOnRole() {
+            const role = currentUserProfile?.role;
+            const status = currentUserProfile?.roleStatus;
+            
+            ['nav-stats', 'nav-hebdo', 'nav-campings', 'nav-users'].forEach(id => {
+                const el = document.getElementById(id);
+                if(el) el.classList.add('hidden');
+            });
+
+            const hebdoSwitcher = document.getElementById('hebdo-view-switcher');
+            if(hebdoSwitcher) hebdoSwitcher.classList.add('hidden');
+
+            if (status !== 'approved' && role !== 'admin') return;
+
+            if (['admin', 'direction', 'coordinateur'].includes(role)) {
+                ['nav-stats', 'nav-hebdo', 'nav-campings', 'nav-users'].forEach(id => {
+                    const el = document.getElementById(id);
+                    if(el) el.classList.remove('hidden');
+                });
+                if(hebdoSwitcher) hebdoSwitcher.classList.remove('hidden');
+                toggleHebdoView('manager');
+            } else if (role === 'resp_animation') {
+                const ns = document.getElementById('nav-stats'); if(ns) ns.classList.remove('hidden');
+                const nh = document.getElementById('nav-hebdo'); if(nh) nh.classList.remove('hidden');
+                toggleHebdoView('editor');
+            } else if (role === 'resp_miniclub') {
+                const ns = document.getElementById('nav-stats'); if(ns) ns.classList.remove('hidden');
+            }
+        }
+
+        // --- 2. RENDER FUNCTIONS ---
+
+        function renderDashboard() { 
+            const listEl = document.getElementById('reporting-list');
+            if(!listEl) return;
+            const total = reportingsCache.reduce((acc, curr) => acc + (curr.participants || 0), 0);
+            const kpiTotal = document.getElementById('kpi-week-total');
+            if (kpiTotal) kpiTotal.innerText = total;
+
+            const role = currentUserProfile?.role;
+            const status = currentUserProfile?.roleStatus;
+            const isRestricted = (role === 'animateur' || status === 'pending') && role !== 'admin';
+            const kpiSection = document.getElementById('dash-kpi-section');
+            if (kpiSection) {
+                kpiSection.style.display = isRestricted ? 'none' : 'grid';
+            }
+            
+            const canDelete = ['admin', 'direction', 'coordinateur'].includes(role);
+
+            listEl.innerHTML = reportingsCache.slice(0, 10).map(rp => `
+                <div class="bg-white p-3 rounded-xl border border-slate-100 shadow-sm flex justify-between items-center mb-2">
+                    <div>
+                        <p class="font-bold text-sm text-slate-800">${rp.activityName}</p>
+                        <p class="text-xs text-slate-400">${formatDate(rp.date)} - ${rp.userName || '?'}</p>
+                    </div>
+                    <div class="flex items-center space-x-3">
+                        <span class="font-bold text-lg text-slate-800">${rp.participants}</span>
+                        ${canDelete ? `<button onclick="window.deleteReporting('${rp.id}')" class="text-slate-300 hover:text-red-500 transition"><i class="fas fa-trash"></i></button>` : ''}
+                    </div>
+                </div>
+            `).join('') || '<div class="text-center text-xs text-slate-400 py-4">Historique vide</div>';
+        }
+
+        function renderStats() {
+            const ctxPie = document.getElementById('chart-types');
+            const ctxLine = document.getElementById('chart-time');
+            if (!ctxPie || !ctxLine) return;
+
+            const total = filteredReportings.reduce((acc, r) => acc + (r.participants || 0), 0);
+            const count = filteredReportings.length;
+            const avg = count > 0 ? Math.round(total / count) : 0;
+            
+            const st = document.getElementById('stat-total'); if(st) st.innerText = total;
+            const sc = document.getElementById('stat-count'); if(sc) sc.innerText = count;
+            const sa = document.getElementById('stat-avg'); if(sa) sa.innerText = avg;
+
+            const statsByType = {};
+            filteredReportings.forEach(rp => { if(rp.types) rp.types.forEach(t => statsByType[t] = (statsByType[t] || 0) + rp.participants); });
+
+            if (charts.pie) charts.pie.destroy();
+            charts.pie = new Chart(ctxPie, {
+                type: 'doughnut',
+                data: { labels: Object.keys(statsByType), datasets: [{ data: Object.values(statsByType), backgroundColor: ['#AE2C2B', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6', '#EC4899', '#6366F1', '#14B8A6'], borderWidth: 1 }] },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { boxWidth: 12, font: {size: 10} } } } }
+            });
+
+            const statsByDate = {};
+            filteredReportings.forEach(rp => { statsByDate[rp.date] = (statsByDate[rp.date] || 0) + rp.participants; });
+            const sortedDates = Object.keys(statsByDate).sort();
+            const dataPoints = sortedDates.map(d => statsByDate[d]);
+
+            if (charts.line) charts.line.destroy();
+            charts.line = new Chart(ctxLine, {
+                type: 'line',
+                data: { labels: sortedDates.map(d => formatDate(d)), datasets: [{ label: 'Participants', data: dataPoints, borderColor: '#AE2C2B', backgroundColor: 'rgba(174, 44, 43, 0.1)', fill: true, tension: 0.3 }] },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+            });
+        }
+
+        function calculateHebdoStats() {
+            const stats = { aquatic: 0, sport: 0, nature: 0, fitness: 0, apero: 0, artistic: 0, theme: 0, minidisco: 0, dance: 0, other_evening: 0 };
+            reportingsCache.forEach(rp => {
+                const p = rp.participants || 0;
+                if (!rp.types) return;
+                rp.types.forEach(t => {
+                    if (['AquaGym'].includes(t)) stats.aquatic += p;
+                    if (['Sport', 'Activité ludique'].includes(t)) stats.sport += p;
+                    if (['Sortie extérieur'].includes(t)) stats.nature += p;
+                    if (['Fitness'].includes(t)) stats.fitness += p;
+                    if (['Jeux apéro', 'Jeux café'].includes(t)) stats.apero += p;
+                    if (['Concert', 'Spectacle'].includes(t)) stats.artistic += p;
+                    if (['Soirée'].includes(t)) stats.theme += p;
+                    if (['Mini Disco'].includes(t)) stats.minidisco += p;
+                    if (['Autre'].includes(t)) stats.other_evening += p;
+                });
+            });
+            const setVal = (id, val) => { const el = document.getElementById(id); if(el) el.value = val; };
+            setVal('hebdo-aqua-nb', stats.aquatic); setVal('hebdo-sport-nb', stats.sport); setVal('hebdo-nature-nb', stats.nature);
+            setVal('hebdo-fitness-nb', stats.fitness); setVal('hebdo-apero-nb', stats.apero); setVal('hebdo-art-nb', stats.artistic);
+            setVal('hebdo-soiree-nb', stats.theme); setVal('hebdo-minidisco-nb', stats.minidisco); setVal('hebdo-danse-nb', stats.dance);
+            setVal('hebdo-autre-nb', stats.other_evening);
+        }
+
+        function renderCampingsList() {
+            const container = document.getElementById('campings-grid');
+            if (!container) return;
+            container.innerHTML = campingsCache.map(c => `
+                <div class="bg-white p-5 rounded-2xl border border-slate-100 shadow-sm flex flex-col justify-between hover:shadow-md transition">
+                    <div>
+                        <h3 class="font-bold text-slate-900 text-lg">${c.name}</h3>
+                        <div class="space-y-1 mt-2 text-xs text-slate-500">
+                            <p><i class="fas fa-user-tie w-5"></i> ${c.directorName}</p>
+                            ${c.coordinateurName ? `<p class="text-blue-600"><i class="fas fa-network-wired w-5"></i> ${c.coordinateurName}</p>` : ''}
+                            ${c.respAnimName ? `<p class="text-tsa-red"><i class="fas fa-bullhorn w-5"></i> ${c.respAnimName}</p>` : ''}
+                            ${c.respMiniClubName ? `<p class="text-purple-400"><i class="fas fa-child"></i> ${c.respMiniClubName}</p>` : ''}
+                        </div>
+                    </div>
+                    <div class="mt-3 pt-3 border-t border-slate-50 flex justify-end">
+                        <button onclick="window.editCamping('${c.id}')" class="text-xs text-tsa-red font-bold uppercase">Modifier</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        function renderUsersList() {
+            const container = document.getElementById('users-list');
+            if (!container) return;
+            const myRole = currentUserProfile ? currentUserProfile.role : '';
+            const isAdmin = myRole === 'admin';
+            const purgeBtn = document.getElementById('btn-purge-users');
+            if (purgeBtn) purgeBtn.style.display = isAdmin ? 'block' : 'none';
+
+            container.innerHTML = usersCache.map(u => {
+                const statusColor = u.roleStatus === 'approved' ? 'text-green-500' : 'text-orange-500';
+                const canValidate = isAdmin || (myRole === 'coordinateur' && ['resp_animation', 'resp_miniclub'].includes(u.role));
+                
+                return `
+                <div class="flex items-center justify-between bg-white p-3 rounded-xl border border-slate-100 mb-2 animate-fade-in">
+                    <div class="flex items-center space-x-3">
+                        <img src="${u.photoURL || 'https://ui-avatars.com/api/?name='+u.displayName+'&background=f1f5f9&color=64748b'}" class="w-10 h-10 rounded-full object-cover border border-slate-200">
+                        <div>
+                            <p class="font-bold text-sm text-slate-800">${u.displayName}</p>
+                            <p class="text-[10px] text-slate-500 uppercase">${u.role} (${u.camping})</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <i class="fas fa-circle text-[8px] ${statusColor} mr-2"></i>
+                        ${u.roleStatus === 'pending' && canValidate ? `
+                            <button onclick="window.updateRoleStatus('${u.id}', 'approved')" class="text-green-600 bg-green-50 p-1.5 rounded hover:bg-green-100"><i class="fas fa-check"></i></button>
+                            <button onclick="window.updateRoleStatus('${u.id}', 'rejected')" class="text-red-600 bg-red-50 p-1.5 rounded hover:bg-red-100"><i class="fas fa-times"></i></button>
+                        ` : ''}
+                        ${isAdmin ? `<button onclick="window.deleteUserRole('${u.id}')" class="text-slate-300 hover:text-red-500 p-1.5 transition"><i class="fas fa-trash"></i></button>` : ''}
+                    </div>
+                </div>`;
+            }).join('');
+        }
+
+        function renderHebdoManagerView() {
+            const container = document.getElementById('hebdo-list-container');
+            if(!container) return;
+            if(weeklyReportsCache.length === 0) { container.innerHTML = '<p class="text-center text-slate-400 py-8">Aucun rapport.</p>'; return; }
+            
+            if (hebdoViewMode === 'grid') {
+                container.className = "grid grid-cols-1 sm:grid-cols-2 gap-4";
+                container.innerHTML = weeklyReportsCache.map(r => `
+                    <div class="bg-white p-4 rounded-xl border border-slate-100 shadow-sm">
+                        <div class="flex justify-between mb-2"><h3 class="font-bold text-slate-800">${r.camping}</h3><span class="text-xs bg-slate-100 px-2 py-1 rounded">S${r.weekNumber}</span></div>
+                        <p class="text-xs text-slate-500 mb-2">Par ${r.authorName}</p>
+                        <button class="w-full bg-slate-50 text-slate-600 text-xs py-2 rounded">Voir Détails</button>
+                    </div>`).join('');
+            } else {
+                container.className = "space-y-2";
+                container.innerHTML = weeklyReportsCache.map(r => `<div class="bg-white p-3 rounded-xl border border-slate-100 flex justify-between"><span>${r.camping} (S${r.weekNumber})</span><span class="text-xs text-slate-500">${r.authorName}</span></div>`).join('');
+            }
+        }
+
+        function renderNotifications() {
+            const container = document.getElementById('notif-list');
+            if(!container) return;
+            container.innerHTML = notificationsCache.length ? notificationsCache.map(n => `<div class="p-3 border-b text-xs border-slate-50 ${n.read ? 'opacity-50' : 'bg-blue-50/30'}" onclick="window.markNotifRead('${n.id}')"><b>${n.title}</b><br>${n.body}</div>`).join('') : '<p class="text-center text-xs p-2 text-slate-400">Rien</p>';
+        }
+
+        function populateDropdowns() {
+            const options = campingsCache.map(c => `<option value="${c.name}">${c.name}</option>`).join('');
+            const s1 = document.getElementById('reg-camping');
+            const s2 = document.getElementById('prof-camping');
+            const s3 = document.getElementById('stat-filter-camping');
+            const s4 = document.getElementById('rp-camping');
+
+            if(s1) s1.innerHTML = `<option disabled selected>Choisir un camping...</option>` + options;
+            if(s2) { const old = s2.value; s2.innerHTML = options; if(old) s2.value = old; }
+            if(s3) s3.innerHTML = `<option value="all">Tous les campings</option>` + options;
+            if(s4) s4.innerHTML = options; 
+        }
+
+        function populateCampingFormUsers() {
+            const getOpts = (role) => `<option value="">Non assigné</option>` + usersCache.filter(u=>u.role===role).map(u=>`<option value="${u.uid}">${u.displayName}</option>`).join('');
+            document.getElementById('camp-coord').innerHTML = getOpts('coordinateur');
+            document.getElementById('camp-resp-anim').innerHTML = getOpts('resp_animation');
+            document.getElementById('camp-resp-mc').innerHTML = getOpts('resp_miniclub');
+        }
+
+        // --- 3. UTILS & ACTIONS ---
+        function formatDate(d) { return d ? new Date(d).toLocaleDateString('fr-FR') : ''; }
+        function getWeekNumber(d) { d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate())); d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay()||7)); var yearStart = new Date(Date.UTC(d.getUTCFullYear(),0,1)); return Math.ceil((((d - yearStart) / 86400000) + 1)/7); }
+        function showToast(m,t='success'){ const d=document.createElement('div'); d.className=`fixed top-4 right-4 px-6 py-4 rounded-xl shadow-xl z-[100] text-white text-sm ${t==='success'?'bg-slate-900':'bg-red-600'}`; d.innerText=m; document.body.appendChild(d); setTimeout(()=>d.remove(),3000); }
+        function setLoading(b) { document.querySelector('.loading-overlay').style.display=b?'flex':'none'; }
+        
+        function clearListeners() {
+            if (unsubProfile) unsubProfile();
+            if (unsubReportings) unsubReportings();
+            if (unsubUsers) unsubUsers();
+            if (unsubCampings) unsubCampings();
+            if (unsubNotifs) unsubNotifs();
+            if (unsubWeekly) unsubWeekly();
+        }
+
+        // --- 4. AUTH & SYNC LOGIC ---
 
         onAuthStateChanged(auth, async (user) => {
             if (user) {
@@ -100,473 +450,138 @@
                 if (docSnap.exists()) {
                     currentUserProfile = docSnap.data();
                 } else {
-                    currentUserProfile = { 
-                        role: 'animateur', camping: 'Inconnu', roleStatus: 'pending', 
-                        displayName: currentUser.displayName || 'Utilisateur', email: currentUser.email, photoURL: currentUser.photoURL
-                    };
+                    currentUserProfile = { role: 'animateur', camping: 'Inconnu', roleStatus: 'pending', displayName: currentUser.displayName, email: currentUser.email, photoURL: currentUser.photoURL };
                 }
                 updateProfileUI();
                 updateNavBasedOnRole();
-            } catch (e) { console.error("Profile load error", e); }
-        }
-
-        function clearListeners() {
-            if (unsubProfile) unsubProfile();
-            if (unsubReportings) unsubReportings();
-            if (unsubUsers) unsubUsers();
-            if (unsubCampings) unsubCampings();
-            if (unsubNotifs) unsubNotifs();
-        }
-
-        function showApp() {
-            document.getElementById('view-auth').classList.add('hidden');
-            document.getElementById('view-app').classList.remove('hidden');
-            switchTab('dashboard');
-        }
-
-        function showAuth() {
-            document.getElementById('view-auth').classList.remove('hidden');
-            document.getElementById('view-app').classList.add('hidden');
+            } catch (e) { console.error("Profile Error", e); }
         }
 
         function initRealtimeData() {
-            clearListeners(); 
-            
-            unsubProfile = onSnapshot(doc(db, 'users', currentUser.uid), (docSnap) => {
-                if (docSnap.exists()) {
-                    currentUserProfile = docSnap.data();
-                    updateProfileUI();
-                    updateNavBasedOnRole();
-                }
+            clearListeners();
+            unsubProfile = onSnapshot(doc(db, 'users', currentUser.uid), (s) => { 
+                if (s.exists()) { 
+                    currentUserProfile = s.data(); 
+                    updateProfileUI(); 
+                    updateNavBasedOnRole(); 
+                    renderDashboard(); 
+                } 
             });
 
             const role = currentUserProfile?.role || 'animateur';
-            const status = currentUserProfile?.roleStatus;
+            
+            // 1. Reportings - SECURED QUERY
+            let qRep;
+            if (['admin', 'direction', 'coordinateur'].includes(role)) {
+                qRep = collection(db, 'reportings'); 
+            } else if (role === 'resp_animation' || role === 'resp_miniclub') {
+                qRep = query(collection(db, 'reportings'), where('camping', '==', currentUserProfile.camping)); 
+            } else {
+                qRep = query(collection(db, 'reportings'), where('userId', '==', currentUser.uid));
+            }
 
-            let qRep = query(collection(db, 'reportings')); 
             unsubReportings = onSnapshot(qRep, (snapshot) => {
                 const docs = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
                 reportingsCache = docs.filter(r => {
-                    if (status !== 'approved' && role !== 'admin') return false; 
+                    const status = currentUserProfile?.roleStatus;
+                    if (status !== 'approved' && role !== 'admin') {
+                        return r.userId === currentUser.uid; 
+                    }
                     if (['admin', 'direction', 'coordinateur'].includes(role)) return true;
                     if (role === 'resp_animation') return r.camping === currentUserProfile.camping;
-                    if (role === 'resp_miniclub') {
-                        const mcTypes = ['Enfant', 'Mini Disco', 'Activité ludique', 'Spectacle', 'Maquillage'];
-                        return r.camping === currentUserProfile.camping && r.types && r.types.some(t => mcTypes.includes(t));
-                    }
+                    if (role === 'resp_miniclub') { const mcTypes = ['Enfant', 'Mini Disco', 'Activité ludique', 'Spectacle', 'Maquillage']; return r.camping === currentUserProfile.camping && r.types && r.types.some(t => mcTypes.includes(t)); }
                     if (role === 'animateur') return r.userId === currentUser.uid;
                     return false;
                 }).sort((a,b) => (b.date || '').localeCompare(a.date || ''));
                 
                 filteredReportings = [...reportingsCache];
-                renderDashboard();
-                renderStats();
-                calculateHebdoStats();
-            });
+                renderDashboard(); renderStats(); calculateHebdoStats();
+            }, (error) => console.log("Reportings Sync Error:", error.code));
 
-            unsubCampings = onSnapshot(collection(db, 'campings'), (snap) => {
-                campingsCache = snap.docs.map(d => ({id: d.id, ...d.data()}));
-                renderCampingsList();
-                populateDropdowns();
-            });
-
-            if (['admin', 'direction', 'coordinateur'].includes(role)) {
-                unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
-                    usersCache = snap.docs.map(d => ({id: d.id, ...d.data()}));
-                    renderUsersList();
-                });
-            } else {
-                usersCache = [];
+            // 2. Weekly Reports
+            if (['admin', 'direction', 'coordinateur', 'resp_animation'].includes(role)) {
+                unsubWeekly = onSnapshot(collection(db, 'weekly_reports'), (s) => { 
+                    weeklyReportsCache = s.docs.map(d => ({id: d.id, ...d.data()})).sort((a,b) => b.createdAt?.seconds - a.createdAt?.seconds);
+                    renderHebdoManagerView(); 
+                }, (error) => console.log("Weekly Sync Error:", error.code));
             }
 
-            const qNotif = query(collection(db, 'notifications'), where('recipientId', '==', currentUser.uid));
-            unsubNotifs = onSnapshot(qNotif, (snap) => {
-                const docs = snap.docs.map(d => ({id: d.id, ...d.data()}));
-                notificationsCache = docs.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-                const unread = notificationsCache.filter(n => !n.read).length;
-                const badge = document.getElementById('notif-badge');
-                if(badge) {
-                    badge.innerText = unread;
-                    badge.style.display = unread > 0 ? 'flex' : 'none';
-                }
-                renderNotifications();
-            });
+            unsubCampings = onSnapshot(collection(db, 'campings'), (s) => { campingsCache = s.docs.map(d => ({id: d.id, ...d.data()})); renderCampingsList(); populateDropdowns(); });
+
+            if (['admin', 'direction', 'coordinateur'].includes(role)) {
+                unsubUsers = onSnapshot(collection(db, 'users'), (s) => { usersCache = s.docs.map(d => ({id: d.id, ...d.data()})); renderUsersList(); });
+            }
+
+            const qN = query(collection(db, 'notifications'), where('recipientId', '==', currentUser.uid));
+            unsubNotifs = onSnapshot(qN, (s) => { notificationsCache = s.docs.map(d => ({id: d.id, ...d.data()})).sort((a,b)=>(b.createdAt?.seconds||0)-(a.createdAt?.seconds||0)); renderNotifications(); });
         }
 
-        window.deleteAllUsersExceptAdmin = async () => {
-            if (!confirm("ATTENTION : Cela va supprimer TOUS les utilisateurs sauf vous. Confirmer ?")) return;
-            const usersToDelete = usersCache.filter(u => u.id !== currentUser.uid);
-            if (usersToDelete.length === 0) return showToast("Aucun autre utilisateur.");
-            setLoading(true);
-            try {
-                const originalCache = [...usersCache];
-                usersCache = usersCache.filter(u => u.id === currentUser.uid);
-                renderUsersList();
-                const promises = usersToDelete.map(u => deleteDoc(doc(db, 'users', u.id)));
-                await Promise.all(promises);
-                showToast(`${usersToDelete.length} utilisateurs supprimés.`);
-            } catch (e) {
-                console.error(e);
-                initRealtimeData(); 
-                showToast("Erreur nettoyage : " + e.message, 'error');
-            } finally { setLoading(false); }
-        };
-
-        window.deleteUserRole = async (uid) => {
-             if (!confirm("Supprimer cet utilisateur ? Action irréversible.")) return;
-             if (currentUserProfile?.role !== 'admin') return showToast("Seul l'Admin peut supprimer.", "error");
-             const originalCache = [...usersCache];
-             usersCache = usersCache.filter(u => u.id !== uid);
-             renderUsersList();
-             try {
-                 await deleteDoc(doc(db, 'users', uid));
-                 showToast("Utilisateur supprimé");
-             } catch(e) { 
-                 console.error(e);
-                 usersCache = originalCache;
-                 renderUsersList();
-                 showToast("Erreur: " + e.message, 'error'); 
-             }
-        };
-
-        window.handleLogin = async (e) => {
-            e.preventDefault();
-            setLoading(true);
-            try {
-                await signInWithEmailAndPassword(auth, document.getElementById('email').value, document.getElementById('password').value);
-                showToast('Connexion réussie', 'success');
-            } catch (error) { showToast(error.message, 'error'); } 
-            finally { setLoading(false); }
-        };
-
-        window.handleRegister = async (e) => {
-            e.preventDefault();
-            setLoading(true);
-            try {
-                const email = document.getElementById('reg-email').value;
-                const password = document.getElementById('reg-password').value;
-                const name = document.getElementById('reg-name').value;
-                const role = document.getElementById('reg-role').value;
-                const camping = document.getElementById('reg-camping').value;
-                const isMiniClub = document.getElementById('reg-miniclub-check').checked;
-
-                if(!role || !camping) throw new Error("Veuillez remplir tous les champs.");
-
-                const userCred = await createUserWithEmailAndPassword(auth, email, password);
-                await updateProfile(userCred.user, { displayName: name });
-                
-                await setDoc(doc(db, 'users', userCred.user.uid), {
-                    uid: userCred.user.uid, email: userCred.user.email, displayName: name, camping: camping, role: role, roleStatus: 'pending', isMiniClub: isMiniClub, createdAt: serverTimestamp()
-                });
-                
-                await addNotification('admin_group', 'Nouveau compte', `${name} (${role}) attend validation.`, 'users');
-                showToast('Compte créé ! En attente de validation.', 'success');
-            } catch (error) { showToast(error.message, 'error'); } 
-            finally { setLoading(false); }
-        };
-
-        window.handleAdminDemo = async () => {
-            setLoading(true);
-            try {
-                const email = "regisseur@team-spirit-animation.fr";
-                const password = "Admin1234!"; 
-                try { await signInWithEmailAndPassword(auth, email, password); } 
-                catch (loginError) {
-                    if (loginError.code === 'auth/user-not-found' || loginError.code === 'auth/invalid-credential') {
-                        const userCred = await createUserWithEmailAndPassword(auth, email, password);
-                        await updateProfile(userCred.user, { displayName: "Admin Régisseur" });
-                    } else { throw loginError; }
-                }
-                await setDoc(doc(db, 'users', auth.currentUser.uid), {
-                    uid: auth.currentUser.uid, email: email, displayName: "Admin Régisseur", camping: "Siège TSA", role: 'admin', roleStatus: 'approved', lastLogin: serverTimestamp()
-                }, { merge: true });
-                showToast('Mode Admin activé', 'success');
-            } catch (error) { showToast("Erreur Admin: " + error.message, 'error'); } 
-            finally { setLoading(false); }
-        };
-
+        // --- 5. WINDOW FUNCTIONS ---
+        window.handleLogin = async (e) => { e.preventDefault(); setLoading(true); try { await signInWithEmailAndPassword(auth, document.getElementById('email').value, document.getElementById('password').value); } catch(e) { showToast(e.message,'error'); } finally { setLoading(false); }};
+        window.handleRegister = async (e) => { e.preventDefault(); setLoading(true); try { const email=document.getElementById('reg-email').value; const pwd=document.getElementById('reg-password').value; const name=document.getElementById('reg-name').value; const role=document.getElementById('reg-role').value; const camp=document.getElementById('reg-camping').value; const mc=document.getElementById('reg-miniclub-check').checked; if(!role||!camp) throw new Error("Champs requis"); const cred = await createUserWithEmailAndPassword(auth, email, pwd); await updateProfile(cred.user, {displayName:name}); await setDoc(doc(db,'users',cred.user.uid), {uid:cred.user.uid, email, displayName:name, camping:camp, role, roleStatus:'pending', isMiniClub:mc, createdAt:serverTimestamp()}); await addNotification('admin_group', 'Nouveau', `${name} (${role})`, 'users'); showToast('Compte créé'); } catch(e) { showToast(e.message,'error'); } finally { setLoading(false); }};
         window.handleLogout = () => signOut(auth);
 
-        window.updateRoleStatus = async (uid, newStatus) => {
-            try {
-                await updateDoc(doc(db, 'users', uid), { roleStatus: newStatus });
-                showToast(`Utilisateur ${newStatus}`);
-            } catch (e) { showToast(e.message, 'error'); }
+        window.submitReporting = async () => { 
+             const selectedTypes = Array.from(document.querySelectorAll('.type-chip.selected')).map(el => el.dataset.value); 
+             if(!selectedTypes.length) return showToast("Type requis", "error"); 
+             await addDoc(collection(db, 'reportings'), { 
+                 userId: currentUser.uid, 
+                 userName: currentUserProfile.displayName, 
+                 activityName: document.getElementById('rp-activity').value, 
+                 date: document.getElementById('rp-date').value, 
+                 startTime: document.getElementById('rp-start').value, 
+                 endTime: document.getElementById('rp-end').value, 
+                 participants: parseInt(document.getElementById('rp-participants').value), 
+                 types: selectedTypes, 
+                 camping: document.getElementById('rp-camping').value || currentUserProfile.camping, 
+                 createdAt: serverTimestamp() 
+             }); 
+             closeModal('modal-reporting'); showToast('Enregistré'); 
         };
-
+        
         window.saveCamping = async () => {
             const id = document.getElementById('camp-id').value;
-            const data = {
-                name: document.getElementById('camp-name').value,
-                directorName: document.getElementById('camp-director').value,
-                phone: document.getElementById('camp-phone').value,
-                address: document.getElementById('camp-address').value,
-                email: document.getElementById('camp-email').value,
-            };
-            try {
-                if (id) await updateDoc(doc(db, 'campings', id), data);
-                else await addDoc(collection(db, 'campings'), data);
-                closeModal('modal-camping');
-                showToast('Camping enregistré');
-            } catch (e) { showToast(e.message, 'error'); }
+            const cid = document.getElementById('camp-coord').value;
+            const raid = document.getElementById('camp-resp-anim').value;
+            const rmcid = document.getElementById('camp-resp-mc').value;
+            if (raid && campingsCache.some(c => c.id !== id && c.respAnimId === raid)) return showToast("Resp. Anim déjà affecté ailleurs", "error");
+            if (rmcid && campingsCache.some(c => c.id !== id && c.respMiniClubId === rmcid)) return showToast("Resp. Club déjà affecté ailleurs", "error");
+            const getName = (uid) => (usersCache.find(u => u.uid === uid) || {}).displayName || '';
+            const data = { name: document.getElementById('camp-name').value, directorName: document.getElementById('camp-director').value, phone: document.getElementById('camp-phone').value, address: document.getElementById('camp-address').value, email: document.getElementById('camp-email').value, coordinateurId: cid, coordinateurName: getName(cid), respAnimId: raid, respAnimName: getName(raid), respMiniClubId: rmcid, respMiniClubName: getName(rmcid) };
+            try { if(id) await updateDoc(doc(db, 'campings', id), data); else await addDoc(collection(db, 'campings'), data); closeModal('modal-camping'); showToast('Enregistré'); } catch(e) { showToast(e.message, 'error'); }
         };
 
-        window.submitReporting = async () => {
-             const selectedTypes = Array.from(document.querySelectorAll('.type-chip.selected')).map(el => el.dataset.value);
-             if(selectedTypes.length === 0) return showToast("Sélectionnez au moins un type", "error");
-             
-             await addDoc(collection(db, 'reportings'), {
-                 userId: currentUser.uid, userName: currentUserProfile.displayName, activityName: document.getElementById('rp-activity').value,
-                 date: document.getElementById('rp-date').value, startTime: document.getElementById('rp-start').value, endTime: document.getElementById('rp-end').value,
-                 participants: parseInt(document.getElementById('rp-participants').value), types: selectedTypes, camping: currentUserProfile.camping || "Inconnu", createdAt: serverTimestamp()
-             });
-             closeModal('modal-reporting');
-             showToast('Reporting enregistré !');
-        };
-
-        window.previewImage = (input) => {
-            if (input.files && input.files[0]) {
-                const reader = new FileReader();
-                reader.onload = (e) => document.getElementById('prof-img-preview').src = e.target.result;
-                reader.readAsDataURL(input.files[0]);
-            }
-        };
-
-        window.saveProfileFull = async () => {
-            setLoading(true);
-            const name = document.getElementById('prof-name').value;
-            const email = document.getElementById('prof-email').value;
-            const camping = document.getElementById('prof-camping').value;
-            const newPwd = document.getElementById('prof-pwd').value;
-            const file = document.getElementById('prof-file').files[0];
-            try {
-                let updates = {};
-                let authUpdates = {};
-                if (file) {
-                    const storageRef = ref(storage, `profile_photos/${currentUser.uid}`);
-                    await uploadBytes(storageRef, file);
-                    const photoURL = await getDownloadURL(storageRef);
-                    updates.photoURL = photoURL;
-                    authUpdates.photoURL = photoURL;
-                }
-                if (email !== currentUser.email) { await updateEmail(currentUser, email); updates.email = email; }
-                if (newPwd) await updatePassword(currentUser, newPwd);
-                if (name !== currentUserProfile.displayName) { updates.displayName = name; authUpdates.displayName = name; }
-                if (!document.getElementById('prof-camping').disabled) updates.camping = camping;
-                if (Object.keys(authUpdates).length > 0) await updateProfile(currentUser, authUpdates);
-                if (Object.keys(updates).length > 0) await updateDoc(doc(db, 'users', currentUser.uid), updates);
-                showToast("Profil mis à jour !", "success");
-                document.getElementById('prof-pwd').value = ""; 
-            } catch (error) {
-                console.error(error);
-                if (error.code === 'auth/requires-recent-login') { showToast("Reconnexion requise pour modifier email/mdp", "error"); setTimeout(() => handleLogout(), 2000); } 
-                else { showToast(error.message, "error"); }
-            } finally { setLoading(false); }
-        };
-
-        // --- UI UTILS ---
-        function updateProfileUI() { 
-            if(currentUserProfile) {
-                document.getElementById('user-name-display').innerText = currentUserProfile.displayName;
-                document.getElementById('user-camping-display').innerText = currentUserProfile.camping;
-                document.getElementById('prof-name').value = currentUserProfile.displayName || '';
-                document.getElementById('prof-email').value = currentUserProfile.email || '';
-                document.getElementById('prof-role').innerText = (currentUserProfile.role || '').toUpperCase();
-                const pCamp = document.getElementById('prof-camping');
-                pCamp.value = currentUserProfile.camping;
-                pCamp.disabled = !['admin', 'coordinateur'].includes(currentUserProfile.role);
-                const imgUrl = currentUserProfile.photoURL || `https://ui-avatars.com/api/?name=${currentUserProfile.displayName}&background=random`;
-                document.getElementById('prof-img-preview').src = imgUrl;
-            }
-        }
-
-        function renderUsersList() {
-            const container = document.getElementById('users-list');
-            if (!container) return;
-            
-            const myRole = currentUserProfile ? currentUserProfile.role : '';
-            const isAdmin = myRole === 'admin';
-            
-            const purgeBtn = document.getElementById('btn-purge-users');
-            if (purgeBtn) purgeBtn.style.display = isAdmin ? 'block' : 'none';
-
-            container.innerHTML = usersCache.length ? usersCache.map(u => {
-                const statusColor = u.roleStatus === 'approved' ? 'text-green-500' : 'text-orange-500';
-                const canValidate = isAdmin || (myRole === 'coordinateur' && ['resp_animation', 'resp_miniclub'].includes(u.role));
-                
-                return `
-                <div class="flex items-center justify-between bg-white p-3 rounded-xl border border-slate-100 mb-2 animate-fade-in">
-                    <div class="flex items-center space-x-3">
-                        <img src="${u.photoURL || 'https://ui-avatars.com/api/?name='+u.displayName+'&background=f1f5f9&color=64748b'}" class="w-10 h-10 rounded-full object-cover border border-slate-200">
-                        <div>
-                            <p class="font-bold text-sm text-slate-800">${u.displayName}</p>
-                            <p class="text-[10px] text-slate-500 uppercase">${u.role} (${u.camping})</p>
-                        </div>
-                    </div>
-                    <div class="flex items-center space-x-2">
-                        <i class="fas fa-circle text-[8px] ${statusColor} mr-2"></i>
-                        ${u.roleStatus === 'pending' && canValidate ? `
-                            <button onclick="updateRoleStatus('${u.id}', 'approved')" class="text-green-600 bg-green-50 p-1.5 rounded hover:bg-green-100"><i class="fas fa-check"></i></button>
-                            <button onclick="updateRoleStatus('${u.id}', 'rejected')" class="text-red-600 bg-red-50 p-1.5 rounded hover:bg-red-100"><i class="fas fa-times"></i></button>
-                        ` : ''}
-                        ${isAdmin ? `<button onclick="deleteUserRole('${u.id}')" class="text-slate-300 hover:text-red-500 p-1.5 transition"><i class="fas fa-trash"></i></button>` : ''}
-                    </div>
-                </div>`;
-            }).join('') : '<p class="text-center text-sm text-slate-400 p-4">Aucun utilisateur</p>';
-        }
-
-        function updateNavBasedOnRole() {
-            const role = currentUserProfile?.role;
-            const status = currentUserProfile?.roleStatus;
-            ['nav-stats', 'nav-hebdo', 'nav-campings', 'nav-users'].forEach(id => document.getElementById(id).classList.add('hidden'));
-            if (status !== 'approved' && role !== 'admin') return;
-            if (['admin', 'direction', 'coordinateur'].includes(role)) {
-                ['nav-stats', 'nav-hebdo', 'nav-campings', 'nav-users'].forEach(id => document.getElementById(id).classList.remove('hidden'));
-            } else if (role === 'resp_animation') {
-                document.getElementById('nav-stats').classList.remove('hidden');
-                document.getElementById('nav-hebdo').classList.remove('hidden');
-            } else if (role === 'resp_miniclub') {
-                document.getElementById('nav-stats').classList.remove('hidden');
-            }
-        }
-
-        function populateDropdowns() {
-            const options = campingsCache.map(c => `<option value="${c.name}">${c.name}</option>`).join('');
-            const s1 = document.getElementById('reg-camping');
-            const s2 = document.getElementById('prof-camping');
-            const s3 = document.getElementById('stat-filter-camping');
-            if(s1) s1.innerHTML = `<option disabled selected>Choisir un camping...</option>` + options;
-            if(s2) { const old = s2.value; s2.innerHTML = options; if(old) s2.value = old; }
-            if(s3) s3.innerHTML = `<option value="all">Tous les campings</option>` + options;
-        }
-
-        async function addNotification(targetId, title, body, type='info') {
-            await addDoc(collection(db, 'notifications'), { recipientId: targetId, title, body, type, read: false, createdAt: serverTimestamp() });
-        }
-
-        function formatDate(d) { return d ? new Date(d).toLocaleDateString('fr-FR') : ''; }
-        function setLoading(bool) { document.querySelector('.loading-overlay').style.display = bool ? 'flex' : 'none'; }
+        window.editCamping = (id) => { populateCampingFormUsers(); const c = campingsCache.find(x => x.id === id); if(!c) return; document.getElementById('camp-id').value = c.id; document.getElementById('camp-name').value = c.name; document.getElementById('camp-director').value = c.directorName; document.getElementById('camp-phone').value = c.phone; document.getElementById('camp-address').value = c.address; document.getElementById('camp-email').value = c.email; document.getElementById('camp-coord').value = c.coordinateurId||""; document.getElementById('camp-resp-anim').value = c.respAnimId||""; document.getElementById('camp-resp-mc').value = c.respMiniClubId||""; openModal('modal-camping'); };
+        window.saveHebdo = async () => { setLoading(true); try { const formData = { authorId: currentUser.uid, authorName: currentUserProfile.displayName, camping: currentUserProfile.camping, weekNumber: getWeekNumber(new Date()), createdAt: serverTimestamp(), participations: { aquatic: document.getElementById('hebdo-aqua-nb').value, sport: document.getElementById('hebdo-sport-nb').value }, bilanGlobal: document.getElementById('hebdo-bilan-global')?.value || "", commentaires: document.getElementById('hebdo-com-general')?.value || "" }; await addDoc(collection(db, 'weekly_reports'), formData); showToast("Rapport sauvegardé"); if(['admin','direction','coordinateur'].includes(currentUserProfile.role)) toggleHebdoView('manager'); } catch(e) { showToast(e.message, "error"); } finally { setLoading(false); } };
+        window.deleteAllUsersExceptAdmin = async () => { if(!confirm("Purger ?")) return; setLoading(true); try { const u = usersCache.filter(u=>u.id!==currentUser.uid); await Promise.all(u.map(x=>deleteDoc(doc(db,'users',x.id)))); showToast("Purgé"); } catch(e){showToast(e.message,'error');} finally {setLoading(false);} };
+        window.deleteUserRole = async (uid) => { if(!confirm("Supprimer ?")) return; const old = [...usersCache]; usersCache = usersCache.filter(u => u.id !== uid); renderUsersList(); try { await deleteDoc(doc(db, 'users', uid)); showToast("Supprimé"); } catch(e) { console.error(e); usersCache = old; renderUsersList(); showToast(e.message, 'error'); } };
+        window.updateRoleStatus = async (id, s) => { await updateDoc(doc(db,'users',id), {roleStatus:s}); };
+        window.saveProfileFull = async () => { setLoading(true); const name = document.getElementById('prof-name').value; const email = document.getElementById('prof-email').value; const camping = document.getElementById('prof-camping').value; const newPwd = document.getElementById('prof-pwd').value; const file = document.getElementById('prof-file').files[0]; try { let updates = {}, authUpdates = {}; if (file) { const sRef = ref(storage, `profile_photos/${currentUser.uid}`); await uploadBytes(sRef, file); const url = await getDownloadURL(sRef); updates.photoURL = url; authUpdates.photoURL = url; } if (email !== currentUser.email) { await updateEmail(currentUser, email); updates.email = email; } if (newPwd) await updatePassword(currentUser, newPwd); if (name !== currentUserProfile.displayName) { updates.displayName = name; authUpdates.displayName = name; } if (!document.getElementById('prof-camping').disabled) updates.camping = camping; if (Object.keys(authUpdates).length > 0) await updateProfile(currentUser, authUpdates); if (Object.keys(updates).length > 0) await updateDoc(doc(db, 'users', currentUser.uid), updates); showToast("Profil mis à jour"); document.getElementById('prof-pwd').value = ""; } catch (e) { showToast(e.message, "error"); } finally { setLoading(false); } };
         
-        function showToast(msg, type='success') {
-            const t = document.createElement('div');
-            t.className = `fixed top-4 right-4 text-white px-6 py-4 rounded-xl shadow-xl z-[100] animate-fade-in flex items-center text-sm font-medium ${type==='success'?'bg-slate-900':'bg-red-600'}`;
-            t.innerHTML = `<span>${msg}</span>`;
-            document.body.appendChild(t);
-            setTimeout(() => t.remove(), 3000);
-        }
+        window.deleteReporting = async (id) => { if(!confirm("Supprimer ce reporting ?")) return; try { await deleteDoc(doc(db, 'reportings', id)); showToast("Supprimé"); } catch(e){ showToast(e.message,'error'); }};
 
-        function calculateHebdoStats() {
-            const stats = { aquatic: 0, sport: 0, nature: 0, fitness: 0, apero: 0, artistic: 0, theme: 0, minidisco: 0, dance: 0, other_evening: 0 };
-            reportingsCache.forEach(rp => {
-                const p = rp.participants || 0;
-                if (!rp.types) return;
-                rp.types.forEach(t => {
-                    if (['AquaGym'].includes(t)) stats.aquatic += p;
-                    if (['Sport', 'Activité ludique'].includes(t)) stats.sport += p;
-                    if (['Sortie extérieur'].includes(t)) stats.nature += p;
-                    if (['Fitness'].includes(t)) stats.fitness += p;
-                    if (['Jeux apéro', 'Jeux café'].includes(t)) stats.apero += p;
-                    if (['Concert', 'Spectacle', 'Concert'].includes(t)) stats.artistic += p;
-                    if (['Soirée'].includes(t)) stats.theme += p;
-                    if (['Mini Disco'].includes(t)) stats.minidisco += p;
-                    if (['Autre'].includes(t)) stats.other_evening += p;
-                });
-            });
-            const setVal = (id, val) => { const el = document.getElementById(id); if(el) el.value = val; };
-            setVal('hebdo-aqua-nb', stats.aquatic);
-            setVal('hebdo-sport-nb', stats.sport);
-            setVal('hebdo-nature-nb', stats.nature);
-            setVal('hebdo-fitness-nb', stats.fitness);
-            setVal('hebdo-apero-nb', stats.apero);
-            setVal('hebdo-art-nb', stats.artistic);
-            setVal('hebdo-soiree-nb', stats.theme);
-            setVal('hebdo-minidisco-nb', stats.minidisco);
-            setVal('hebdo-danse-nb', stats.dance);
-            setVal('hebdo-autre-nb', stats.other_evening);
-        }
-
-        function renderDashboard() { 
-            const listEl = document.getElementById('reporting-list');
-            if(!listEl) return;
-            const total = reportingsCache.reduce((acc, curr) => acc + (curr.participants || 0), 0);
-            document.getElementById('kpi-week-total').innerText = total;
-            listEl.innerHTML = reportingsCache.slice(0, 10).map(rp => `
-                <div class="bg-white p-3 rounded-xl border border-slate-100 shadow-sm flex justify-between items-center mb-2">
-                    <div><p class="font-bold text-sm text-slate-800">${rp.activityName}</p><p class="text-xs text-slate-400">${formatDate(rp.date)}</p></div>
-                    <span class="font-bold text-lg text-slate-800">${rp.participants}</span>
-                </div>
-            `).join('') || '<div class="text-center text-xs text-slate-400 py-4">Historique vide</div>';
-        }
-        function renderNotifications() { /* ... */ }
-        function renderCampingsList() { 
-            const container = document.getElementById('campings-grid');
-            if (!container) return;
-            container.innerHTML = campingsCache.map(c => `
-                <div class="bg-white p-4 rounded-xl border border-slate-100 shadow-sm flex flex-col justify-between">
-                    <div><h3 class="font-bold text-slate-800 text-lg">${c.name}</h3><p class="text-xs text-slate-500"><i class="fas fa-user-tie mr-1"></i> ${c.directorName}</p></div>
-                    <div class="mt-3 pt-3 border-t border-slate-50 flex justify-end"><button onclick="editCamping('${c.id}')" class="text-tsa-red text-xs font-bold uppercase">Modifier</button></div>
-                </div>
-            `).join('');
-        }
-        
-        function renderStats() {
-            const ctxPie = document.getElementById('chart-types');
-            const ctxLine = document.getElementById('chart-time');
-            if (!ctxPie || !ctxLine) return;
-
-            const total = filteredReportings.reduce((acc, r) => acc + (r.participants || 0), 0);
-            const count = filteredReportings.length;
-            const avg = count > 0 ? Math.round(total / count) : 0;
-            
-            document.getElementById('stat-total').innerText = total;
-            document.getElementById('stat-count').innerText = count;
-            document.getElementById('stat-avg').innerText = avg;
-
-            const statsByType = {};
-            filteredReportings.forEach(rp => { if(rp.types) rp.types.forEach(t => statsByType[t] = (statsByType[t] || 0) + rp.participants); });
-
-            if (charts.pie) charts.pie.destroy();
-            charts.pie = new Chart(ctxPie, {
-                type: 'doughnut',
-                data: { labels: Object.keys(statsByType), datasets: [{ data: Object.values(statsByType), backgroundColor: ['#AE2C2B', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6'], borderWidth: 1 }] },
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { boxWidth: 12, font: {size: 10} } } } }
-            });
-
-            const statsByDate = {};
-            filteredReportings.forEach(rp => { statsByDate[rp.date] = (statsByDate[rp.date] || 0) + rp.participants; });
-            const sortedDates = Object.keys(statsByDate).sort();
-            const dataPoints = sortedDates.map(d => statsByDate[d]);
-
-            if (charts.line) charts.line.destroy();
-            charts.line = new Chart(ctxLine, {
-                type: 'line',
-                data: { labels: sortedDates.map(d => formatDate(d)), datasets: [{ label: 'Participants', data: dataPoints, borderColor: '#AE2C2B', backgroundColor: 'rgba(174, 44, 43, 0.1)', fill: true, tension: 0.3 }] },
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
-            });
-        }
-
-        // --- GLOBAL EXPORTS ---
-        window.switchTab = (tabId) => {
-            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
-            document.getElementById('tab-' + tabId).classList.remove('hidden');
-            const navLinks = document.querySelectorAll('.nav-link');
-            navLinks.forEach(l => l.classList.toggle('text-tsa-red', l.dataset.target === tabId));
-            navLinks.forEach(l => l.classList.toggle('text-slate-400', l.dataset.target !== tabId));
-            if(tabId === 'stats') setTimeout(renderStats, 100);
-            if(tabId === 'hebdo') calculateHebdoStats();
-        };
-        window.openModal = (id) => { document.getElementById(id).classList.remove('hidden'); if(id === 'modal-reporting') { const d = document.getElementById('rp-date'); if(d) d.valueAsDate = new Date(); } };
-        window.closeModal = (id) => document.getElementById(id).classList.add('hidden');
-        window.changeParticipants = (d) => { const i = document.getElementById('rp-participants'); i.value = Math.max(0, (parseInt(i.value)||0) + d); };
-        window.toggleAccordion = (id) => { const el = document.getElementById(id); el.classList.toggle('hidden'); const icon = document.getElementById('icon-' + id); if(icon) { icon.classList.toggle('fa-chevron-down'); icon.classList.toggle('fa-chevron-up'); } };
-        window.toggleAuthMode = () => { document.getElementById('form-login').classList.toggle('hidden'); document.getElementById('form-register').classList.toggle('hidden'); };
-        window.toggleNotifPanel = () => document.getElementById('notif-panel').classList.toggle('hidden');
-        window.toggleChip = (el) => { if (el.classList.contains('selected')) { el.classList.remove('selected', 'bg-tsa-red', 'text-white', 'border-transparent'); el.classList.add('bg-white', 'text-slate-600', 'border-slate-200'); } else { el.classList.add('selected', 'bg-tsa-red', 'text-white', 'border-transparent'); el.classList.remove('bg-white', 'text-slate-600', 'border-slate-200'); } };
-        window.editCamping = (id) => { const c = campingsCache.find(x => x.id === id); if (!c) return; document.getElementById('camp-id').value = c.id; document.getElementById('camp-name').value = c.name; document.getElementById('camp-director').value = c.directorName; document.getElementById('camp-phone').value = c.phone; document.getElementById('camp-address').value = c.address; document.getElementById('camp-email').value = c.email; openModal('modal-camping'); };
-        window.applyStatsFilters = () => { /* ... */ };
-        window.exportExcel = () => { /* ... */ };
-        window.exportPDF = async () => { /* ... */ };
+        window.previewImage = (input) => { if (input.files && input.files[0]) { const r = new FileReader(); r.onload = (e) => document.getElementById('prof-img-preview').src = e.target.result; r.readAsDataURL(input.files[0]); } };
         window.markNotifRead = async (id) => { await updateDoc(doc(db, 'notifications', id), { read: true }); };
+        window.toggleHebdoView = (mode) => { const isEd = mode === 'editor'; document.getElementById('hebdo-editor-view').classList.toggle('hidden', !isEd); document.getElementById('hebdo-manager-view').classList.toggle('hidden', isEd); };
+        window.setHebdoDisplay = (d) => { hebdoViewMode = d; renderHebdoManagerView(); };
+        window.filterHebdoList = () => { const t = document.getElementById('hebdo-search').value.toLowerCase(); const f = weeklyReportsCache.filter(r => r.camping.toLowerCase().includes(t)); renderHebdoListItems(f); };
+        window.applyStatsFilters = () => { const fC = document.getElementById('stat-filter-camping').value; const fT = document.getElementById('stat-filter-type').value; const fS = document.getElementById('stat-filter-start').value; const fE = document.getElementById('stat-filter-end').value; filteredReportings = reportingsCache.filter(r => { if (fC && fC !== 'all' && r.camping !== fC) return false; if (fT && fT !== 'all' && (!r.types || !r.types.includes(fT))) return false; if (fS && r.date < fS) return false; if (fE && r.date > fE) return false; return true; }); renderStats(); showToast("Filtres appliqués"); };
+
+        window.exportStatsPDF = async () => { 
+            const { jsPDF } = window.jspdf; const doc = new jsPDF(); 
+            doc.text(`Statistiques - ${document.getElementById('stat-filter-camping').value}`, 10, 10); 
+            if (filteredReportings.length > 0) {
+                 const tableBody = filteredReportings.map(r => [
+                     new Date(r.date).toLocaleDateString(), r.activityName, (r.types||[]).join(', '), r.participants, r.camping
+                 ]);
+                 doc.autoTable({ startY: 20, head: [['Date', 'Activité', 'Type', 'Partic.', 'Camping']], body: tableBody, theme: 'grid', headStyles: { fillColor: [174, 44, 43] } });
+                 doc.save("stats.pdf");
+            } else { showToast("Aucune donnée pour PDF", "error"); }
+        };
+        window.exportStatsExcel = () => { if(filteredReportings.length===0) return showToast("Aucune donnée", "error"); let csv="Date,Activite\n"; filteredReportings.forEach(r=>csv+=`${r.date},${r.activityName}\n`); const a=document.createElement('a'); a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv); a.download='stats.csv'; a.click(); };
+        window.exportHebdoPDF = () => { const { jsPDF } = window.jspdf; const doc = new jsPDF(); doc.text(`Rapport Hebdo`, 10, 10); doc.save("hebdo.pdf"); };
+        window.exportHebdoWord = () => { const h="<html><body><h1>Rapport</h1></body></html>"; const a=document.createElement('a'); a.href='data:application/vnd.ms-word,'+encodeURIComponent(h); a.download='hebdo.doc'; a.click(); };
+        window.sendHebdoMail = () => window.open(`mailto:?subject=Rapport&body=Voir PJ`);
 
     </script>
 </head>
@@ -587,7 +602,6 @@
                 <input type="email" id="email" required class="input-field" placeholder="Email">
                 <input type="password" id="password" required class="input-field" placeholder="Mot de passe">
                 <button type="submit" class="btn-primary">Se connecter</button>
-                <button type="button" onclick="handleAdminDemo()" class="btn-secondary mt-4">Mode Admin (Démo)</button>
             </form>
             <form id="form-register" onsubmit="handleRegister(event)" class="space-y-4 hidden">
                 <input type="text" id="reg-name" required class="input-field" placeholder="Nom Complet">
@@ -630,201 +644,81 @@
             
             <!-- DASHBOARD -->
             <div id="tab-dashboard" class="tab-content p-5 space-y-6">
-                <div>
-                    <h2 class="text-2xl font-bold text-slate-900">Bonjour, <span id="user-name-display" class="text-tsa-red">...</span></h2>
-                    <p class="text-sm text-slate-500"><i class="fas fa-map-pin mr-1"></i><span id="user-camping-display">...</span></p>
-                </div>
+                <div><h2 class="text-2xl font-bold text-slate-900">Bonjour, <span id="user-name-display" class="text-tsa-red">...</span></h2><p class="text-sm text-slate-500"><i class="fas fa-map-pin mr-1"></i><span id="user-camping-display">...</span></p></div>
                 <button onclick="openModal('modal-reporting')" class="btn-big-action"><span>Nouveau Reporting</span><i class="fas fa-plus bg-white/20 p-2 rounded-full"></i></button>
-                <div class="grid grid-cols-2 gap-4">
+                <div id="dash-kpi-section" class="grid grid-cols-2 gap-4">
                     <div class="card-kpi"><i class="fas fa-users text-tsa-red"></i><span id="kpi-week-total" class="text-2xl font-bold block mt-2">0</span><span class="text-xs text-slate-400">Participants</span></div>
                     <div class="card-kpi" onclick="switchTab('hebdo')"><i class="fas fa-file-contract text-orange-500"></i><span class="text-sm font-bold block mt-2">Rapport Hebdo</span><span class="text-xs text-slate-400">Accéder</span></div>
                 </div>
-                <div class="mt-4">
-                    <h3 class="font-bold text-lg mb-2">Activités Récentes</h3>
-                    <div id="reporting-list" class="space-y-2"></div>
-                </div>
+                <div id="dash-history-section" class="mt-4"><h3 class="font-bold text-lg mb-2">Activités Récentes</h3><div id="reporting-list" class="space-y-2"></div></div>
             </div>
 
-            <!-- CAMPINGS (Admin/Coordo) -->
+            <!-- CAMPINGS -->
             <div id="tab-campings" class="tab-content hidden p-5 space-y-4">
-                <div class="flex justify-between items-center">
-                    <h2 class="text-2xl font-bold text-slate-900">Campings</h2>
-                    <!-- NOUVEAU BOUTON CLAIR -->
-                    <button onclick="openModal('modal-camping'); document.getElementById('form-camping').reset(); document.getElementById('camp-id').value='';" class="bg-slate-900 text-white px-4 py-2 rounded-lg shadow-lg flex items-center text-sm font-bold">
-                        <i class="fas fa-plus mr-2"></i> Ajouter
-                    </button>
-                </div>
+                <div class="flex justify-between items-center"><h2 class="text-2xl font-bold text-slate-900">Campings</h2><button onclick="openModal('modal-camping'); document.getElementById('form-camping').reset(); document.getElementById('camp-id').value='';" class="bg-slate-900 text-white px-4 py-2 rounded-lg shadow-lg flex items-center text-sm font-bold"><i class="fas fa-plus mr-1"></i> Ajouter</button></div>
                 <div id="campings-grid" class="grid grid-cols-1 gap-3"></div>
             </div>
 
-            <!-- UTILISATEURS (Admin/Coordo) -->
+            <!-- USERS -->
             <div id="tab-users" class="tab-content hidden p-5 space-y-4">
-                <h2 class="text-2xl font-bold text-slate-900">Utilisateurs</h2>
-                <div class="flex justify-end mb-4">
-                    <button id="btn-purge-users" onclick="deleteAllUsersExceptAdmin()" class="bg-red-100 text-red-600 px-3 py-1 rounded-lg text-xs font-bold border border-red-200 hidden hover:bg-red-200 transition">
-                        <i class="fas fa-trash-alt mr-1"></i> Tout purger
-                    </button>
-                </div>
-                <div id="users-list" class="space-y-2">
-                    <div class="text-center p-4 text-slate-400 text-sm animate-pulse">Chargement des utilisateurs...</div>
-                </div>
+                <div class="flex justify-between items-center"><h2 class="text-2xl font-bold text-slate-900">Utilisateurs</h2><button id="btn-purge-users" onclick="deleteAllUsersExceptAdmin()" class="bg-red-100 text-red-600 px-3 py-1 rounded-lg text-xs font-bold border border-red-200 hidden hover:bg-red-200 transition"><i class="fas fa-trash-alt mr-1"></i> Purger</button></div>
+                <div id="users-list" class="space-y-2"></div>
             </div>
 
             <!-- STATS -->
             <div id="tab-stats" class="tab-content hidden p-5 space-y-6">
                 <h2 class="text-2xl font-bold text-slate-900">Statistiques</h2>
-                
-                <!-- Filters -->
-                <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-100">
-                    <p class="text-xs font-bold text-slate-400 uppercase mb-2">Filtres</p>
+                <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-100 mb-4">
                     <div class="grid grid-cols-2 gap-2 mb-3">
-                        <select id="stat-filter-camping" class="input-field text-xs p-2">
-                            <option value="all">Tous les campings</option>
-                        </select>
+                        <select id="stat-filter-camping" class="input-field text-xs p-2"></select>
                         <select id="stat-filter-type" class="input-field text-xs p-2">
                             <option value="all">Toutes activités</option>
-                            <option value="Sport">Sport</option>
-                            <option value="Enfant">Enfant</option>
-                            <option value="Soirée">Soirée</option>
-                            <option value="Fitness">Fitness</option>
-                            <option value="AquaGym">AquaGym</option>
+                            <option value="Sport">Sport</option><option value="Enfant">Enfant</option><option value="Soirée">Soirée</option><option value="Fitness">Fitness</option><option value="AquaGym">AquaGym</option>
                         </select>
                         <input type="date" id="stat-filter-start" class="input-field text-xs p-2">
                         <input type="date" id="stat-filter-end" class="input-field text-xs p-2">
                     </div>
                     <button onclick="applyStatsFilters()" class="w-full bg-slate-800 text-white py-2 rounded-lg text-xs font-bold">Appliquer les filtres</button>
                 </div>
-
-                <!-- KPIs Grid -->
                 <div class="grid grid-cols-3 gap-2">
-                    <div class="bg-white p-3 rounded-xl border border-slate-100 text-center">
-                        <p class="text-[10px] text-slate-400 uppercase font-bold">Total</p>
-                        <p id="stat-total" class="text-xl font-bold text-tsa-red">0</p>
-                    </div>
-                    <div class="bg-white p-3 rounded-xl border border-slate-100 text-center">
-                        <p class="text-[10px] text-slate-400 uppercase font-bold">Activités</p>
-                        <p id="stat-count" class="text-xl font-bold text-slate-800">0</p>
-                    </div>
-                    <div class="bg-white p-3 rounded-xl border border-slate-100 text-center">
-                        <p class="text-[10px] text-slate-400 uppercase font-bold">Moyenne</p>
-                        <p id="stat-avg" class="text-xl font-bold text-slate-800">0</p>
-                    </div>
+                    <div class="bg-white p-3 rounded-xl border border-slate-100 text-center"><p class="text-[10px] text-slate-400 uppercase font-bold">Total</p><p id="stat-total" class="text-xl font-bold text-tsa-red">0</p></div>
+                    <div class="bg-white p-3 rounded-xl border border-slate-100 text-center"><p class="text-[10px] text-slate-400 uppercase font-bold">Activités</p><p id="stat-count" class="text-xl font-bold text-slate-800">0</p></div>
+                    <div class="bg-white p-3 rounded-xl border border-slate-100 text-center"><p class="text-[10px] text-slate-400 uppercase font-bold">Moyenne</p><p id="stat-avg" class="text-xl font-bold text-slate-800">0</p></div>
                 </div>
-
-                <!-- Charts Grid -->
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div class="bg-white p-4 rounded-xl shadow-card h-64 relative">
-                        <h4 class="text-xs font-bold text-slate-400 mb-2">Répartition Types</h4>
-                        <div class="h-48 relative"><canvas id="chart-types"></canvas></div>
-                    </div>
-                    <div class="bg-white p-4 rounded-xl shadow-card h-64 relative">
-                        <h4 class="text-xs font-bold text-slate-400 mb-2">Évolution Temporelle</h4>
-                        <div class="h-48 relative"><canvas id="chart-time"></canvas></div>
-                    </div>
+                    <div class="bg-white p-4 rounded-xl shadow-card h-64 relative"><h4 class="text-xs font-bold text-slate-400 mb-2">Types</h4><div class="h-48 relative"><canvas id="chart-types"></canvas></div></div>
+                    <div class="bg-white p-4 rounded-xl shadow-card h-64 relative"><h4 class="text-xs font-bold text-slate-400 mb-2">Evolution</h4><div class="h-48 relative"><canvas id="chart-time"></canvas></div></div>
                 </div>
-
-                <!-- Actions -->
                 <div class="flex space-x-3">
-                    <button onclick="exportPDF()" class="flex-1 bg-red-600 text-white py-3 rounded-xl font-bold shadow-lg text-sm flex items-center justify-center">
-                        <i class="fas fa-file-pdf mr-2"></i> Export PDF
-                    </button>
-                    <button onclick="exportExcel()" class="flex-1 bg-green-600 text-white py-3 rounded-xl font-bold shadow-lg text-sm flex items-center justify-center">
-                        <i class="fas fa-file-excel mr-2"></i> Export Excel
-                    </button>
+                    <button onclick="exportStatsPDF()" class="flex-1 bg-red-600 text-white py-3 rounded-xl font-bold shadow-lg text-sm flex items-center justify-center"><i class="fas fa-file-pdf mr-2"></i> PDF</button>
+                    <button onclick="exportStatsExcel()" class="flex-1 bg-green-600 text-white py-3 rounded-xl font-bold shadow-lg text-sm flex items-center justify-center"><i class="fas fa-file-excel mr-2"></i> Excel</button>
                 </div>
             </div>
 
-            <!-- HEBDO (11 SECTIONS) -->
+            <!-- HEBDO -->
             <div id="tab-hebdo" class="tab-content hidden p-5 space-y-4">
                 <h2 class="text-2xl font-bold text-slate-900">Rapport Hebdo</h2>
-                <div class="bg-blue-50 p-4 rounded-lg text-xs text-blue-800 mb-4">Les données sont pré-remplies.</div>
-                
-                <div class="space-y-3">
-                    <!-- SECTION 1 -->
-                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                        <button onclick="toggleAccordion('sec-1')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm">
-                            <span>1. Participations Journée</span>
-                            <i id="icon-sec-1" class="fas fa-chevron-down text-slate-400"></i>
-                        </button>
-                        <div id="sec-1" class="hidden p-4 space-y-4 text-sm">
-                            <div class="grid gap-2">
-                                <label class="text-xs font-bold text-slate-500">Aquatique / Sport / Nature / Fitness / Apéro / Artistique</label>
-                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Aquatique</span><input type="number" id="hebdo-aqua-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
-                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Sport</span><input type="number" id="hebdo-sport-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
-                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Nature</span><input type="number" id="hebdo-nature-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
-                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Fitness</span><input type="number" id="hebdo-fitness-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
-                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Apéro</span><input type="number" id="hebdo-apero-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
-                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Artistique</span><input type="number" id="hebdo-art-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- SECTION 2 -->
-                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                        <button onclick="toggleAccordion('sec-2')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm">
-                            <span>2. Participations Soirées</span>
-                            <i id="icon-sec-2" class="fas fa-chevron-down text-slate-400"></i>
-                        </button>
-                        <div id="sec-2" class="hidden p-4 space-y-4 text-sm">
-                             <div class="flex space-x-2"><span class="w-20 text-xs py-2">Thème</span><input type="number" id="hebdo-soiree-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
-                             <div class="flex space-x-2"><span class="w-20 text-xs py-2">Mini-Disco</span><input type="number" id="hebdo-minidisco-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
-                             <div class="flex space-x-2"><span class="w-20 text-xs py-2">Dansante</span><input type="number" id="hebdo-danse-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
-                             <div class="flex space-x-2"><span class="w-20 text-xs py-2">Autres</span><input type="number" id="hebdo-autre-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
-                        </div>
-                    </div>
-
-                    <!-- SECTION 3 -->
-                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                        <button onclick="toggleAccordion('sec-3')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>3. Retour Général</span><i id="icon-sec-3" class="fas fa-chevron-down text-slate-400"></i></button>
-                        <div id="sec-3" class="hidden p-4 space-y-2 text-sm"><textarea class="w-full border rounded p-2" placeholder="Bilan global..."></textarea><textarea class="w-full border rounded p-2" placeholder="Commentaires généraux..."></textarea></div>
-                    </div>
-
-                    <!-- SECTION 4 -->
-                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                        <button onclick="toggleAccordion('sec-4')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>4. Animations Proposées</span><i id="icon-sec-4" class="fas fa-chevron-down text-slate-400"></i></button>
-                        <div id="sec-4" class="hidden p-4 space-y-2 text-sm"><textarea class="w-full border rounded p-2" placeholder="Animations proposées..."></textarea><textarea class="w-full border rounded p-2" placeholder="Retours vacanciers..."></textarea></div>
-                    </div>
-
-                    <!-- SECTION 5 -->
-                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                        <button onclick="toggleAccordion('sec-5')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>5. Ressources (Journalier)</span><i id="icon-sec-5" class="fas fa-chevron-down text-slate-400"></i></button>
-                        <div id="sec-5" class="hidden p-4 text-sm"><textarea class="w-full border rounded p-2 h-32" placeholder="Samedi: ... Dimanche: ..."></textarea></div>
-                    </div>
-
-                    <!-- SECTION 6 -->
-                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                        <button onclick="toggleAccordion('sec-6')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>6. Mini-Club</span><i id="icon-sec-6" class="fas fa-chevron-down text-slate-400"></i></button>
-                        <div id="sec-6" class="hidden p-4 text-sm space-y-2">
-                            <label><input type="checkbox"> Éducatives</label>
-                            <label><input type="checkbox"> Spectacles</label>
-                            <label><input type="checkbox"> Grands Jeux</label>
-                            <textarea class="w-full border rounded p-2" placeholder="Bilan enfants..."></textarea>
-                        </div>
-                    </div>
-
-                    <!-- SECTION 7 -->
-                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                        <button onclick="toggleAccordion('sec-7')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>7. Signalétiques & Infra</span><i id="icon-sec-7" class="fas fa-chevron-down text-slate-400"></i></button>
-                        <div id="sec-7" class="hidden p-4 text-sm"><textarea class="w-full border rounded p-2" placeholder="État logement, matériel, scène..."></textarea></div>
-                    </div>
-
-                    <!-- SECTION 8 -->
-                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                        <button onclick="toggleAccordion('sec-8')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>8. Relation Staff</span><i id="icon-sec-8" class="fas fa-chevron-down text-slate-400"></i></button>
-                        <div id="sec-8" class="hidden p-4 text-sm"><textarea class="w-full border rounded p-2" placeholder="Rapports avec Direction, Réception, Technique..."></textarea></div>
-                    </div>
-
-                    <!-- SECTION 9 -->
-                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                        <button onclick="toggleAccordion('sec-9')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>9. Équipe Animation</span><i id="icon-sec-9" class="fas fa-chevron-down text-slate-400"></i></button>
-                        <div id="sec-9" class="hidden p-4 text-sm"><textarea class="w-full border rounded p-2" placeholder="État d'esprit des membres..."></textarea></div>
-                    </div>
-
-                    <!-- SECTION 10 & 11 -->
-                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                        <button onclick="toggleAccordion('sec-10')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>10. Moral & 11. Objectifs</span><i id="icon-sec-10" class="fas fa-chevron-down text-slate-400"></i></button>
-                        <div id="sec-10" class="hidden p-4 text-sm space-y-2"><textarea class="w-full border rounded p-2" placeholder="Moral général..."></textarea><textarea class="w-full border rounded p-2" placeholder="Objectifs semaine prochaine..."></textarea></div>
-                    </div>
+                <div id="hebdo-view-switcher" class="flex space-x-2 mb-4 hidden">
+                    <button id="btn-view-editor" onclick="toggleHebdoView('editor')" class="flex-1 py-2 text-xs font-bold rounded-lg border border-slate-200 bg-slate-200">Saisie</button>
+                    <button id="btn-view-manager" onclick="toggleHebdoView('manager')" class="flex-1 py-2 text-xs font-bold rounded-lg border border-slate-200">Liste</button>
+                </div>
+                <div id="hebdo-manager-view" class="hidden space-y-4">
+                    <div class="flex justify-between items-center"><input type="text" id="hebdo-search" oninput="filterHebdoList()" placeholder="Chercher..." class="input-field text-xs py-2 w-2/3"><div class="flex space-x-1"><button onclick="setHebdoDisplay('grid')" class="p-2 rounded bg-slate-100"><i class="fas fa-th-large"></i></button><button onclick="setHebdoDisplay('list')" class="p-2 rounded bg-slate-100"><i class="fas fa-list"></i></button></div></div>
+                    <div id="hebdo-list-container"><p class="text-center text-slate-400 text-sm py-4">Chargement...</p></div>
+                </div>
+                <div id="hebdo-editor-view" class="space-y-4">
+                    <div class="flex justify-between items-center bg-blue-50 p-3 rounded-lg border border-blue-100"><p class="text-xs text-blue-800"><i class="fas fa-magic mr-1"></i> Pré-rempli.</p><div class="flex space-x-2"><button onclick="exportHebdoPDF()" class="text-xs text-red-600 bg-white px-2 py-1 rounded shadow-sm"><i class="fas fa-file-pdf"></i></button><button onclick="exportHebdoWord()" class="text-xs text-blue-600 bg-white px-2 py-1 rounded shadow-sm"><i class="fas fa-file-word"></i></button><button onclick="sendHebdoMail()" class="text-xs text-slate-600 bg-white px-2 py-1 rounded shadow-sm"><i class="fas fa-envelope"></i></button></div></div>
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden"><button onclick="toggleAccordion('sec-1')" class="w-full p-4 text-left font-bold text-sm bg-slate-50 flex justify-between"><span>1. Participations Journée</span><i id="icon-sec-1" class="fas fa-chevron-down"></i></button><div id="sec-1" class="hidden p-4 space-y-2 text-sm"><div class="flex space-x-2"><span class="w-24">Aquatique</span><input type="number" id="hebdo-aqua-nb" readonly class="w-16 border rounded text-center bg-slate-50 font-bold text-tsa-red"></div><div class="flex space-x-2"><span class="w-24">Sport</span><input type="number" id="hebdo-sport-nb" readonly class="w-16 border rounded text-center bg-slate-50 font-bold text-tsa-red"></div><div class="flex space-x-2"><span class="w-24">Nature</span><input type="number" id="hebdo-nature-nb" readonly class="w-16 border rounded text-center bg-slate-50 font-bold text-tsa-red"></div><div class="flex space-x-2"><span class="w-24">Fitness</span><input type="number" id="hebdo-fitness-nb" readonly class="w-16 border rounded text-center bg-slate-50 font-bold text-tsa-red"></div><div class="flex space-x-2"><span class="w-24">Apéro</span><input type="number" id="hebdo-apero-nb" readonly class="w-16 border rounded text-center bg-slate-50 font-bold text-tsa-red"></div><div class="flex space-x-2"><span class="w-24">Artistique</span><input type="number" id="hebdo-art-nb" readonly class="w-16 border rounded text-center bg-slate-50 font-bold text-tsa-red"></div></div></div>
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden"><button onclick="toggleAccordion('sec-2')" class="w-full p-4 text-left font-bold text-sm bg-slate-50 flex justify-between"><span>2. Participations Soirées</span><i id="icon-sec-2" class="fas fa-chevron-down"></i></button><div id="sec-2" class="hidden p-4 space-y-2 text-sm"><div class="flex space-x-2"><span class="w-24">Thème</span><input type="number" id="hebdo-soiree-nb" readonly class="w-16 border rounded text-center bg-slate-50 font-bold text-tsa-red"></div><div class="flex space-x-2"><span class="w-24">Mini-Disco</span><input type="number" id="hebdo-minidisco-nb" readonly class="w-16 border rounded text-center bg-slate-50 font-bold text-tsa-red"></div><div class="flex space-x-2"><span class="w-24">Dansante</span><input type="number" id="hebdo-danse-nb" readonly class="w-16 border rounded text-center bg-slate-50 font-bold text-tsa-red"></div><div class="flex space-x-2"><span class="w-24">Autres</span><input type="number" id="hebdo-autre-nb" readonly class="w-16 border rounded text-center bg-slate-50 font-bold text-tsa-red"></div></div></div>
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden"><button onclick="toggleAccordion('sec-3')" class="w-full p-4 text-left font-bold text-sm bg-slate-50 flex justify-between"><span>3. Bilan & Commentaires</span><i id="icon-sec-3" class="fas fa-chevron-down"></i></button><div id="sec-3" class="hidden p-4 space-y-2 text-sm"><textarea id="hebdo-bilan-global" class="w-full border rounded p-2 h-20" placeholder="Bilan global..."></textarea><textarea id="hebdo-com-general" class="w-full border rounded p-2 h-20" placeholder="Commentaires généraux..."></textarea></div></div>
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden"><button onclick="toggleAccordion('sec-4')" class="w-full p-4 text-left font-bold text-sm bg-slate-50 flex justify-between"><span>4. Animations Proposées</span><i id="icon-sec-4" class="fas fa-chevron-down"></i></button><div id="sec-4" class="hidden p-4"><textarea class="w-full border rounded p-2" placeholder="Détails..."></textarea></div></div>
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden"><button onclick="toggleAccordion('sec-5')" class="w-full p-4 text-left font-bold text-sm bg-slate-50 flex justify-between"><span>5. Ressources (Journalier)</span><i id="icon-sec-5" class="fas fa-chevron-down"></i></button><div id="sec-5" class="hidden p-4"><textarea class="w-full border rounded p-2 h-32" placeholder="Samedi: ... Dimanche: ..."></textarea></div></div>
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden"><button onclick="toggleAccordion('sec-6')" class="w-full p-4 text-left font-bold text-sm bg-slate-50 flex justify-between"><span>6. Mini-Club</span><i id="icon-sec-6" class="fas fa-chevron-down"></i></button><div id="sec-6" class="hidden p-4"><textarea class="w-full border rounded p-2" placeholder="Bilan enfants..."></textarea></div></div>
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden"><button onclick="toggleAccordion('sec-7')" class="w-full p-4 text-left font-bold text-sm bg-slate-50 flex justify-between"><span>7. Signalétiques & Infra</span><i id="icon-sec-7" class="fas fa-chevron-down"></i></button><div id="sec-7" class="hidden p-4"><textarea class="w-full border rounded p-2" placeholder="État matériel..."></textarea></div></div>
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden"><button onclick="toggleAccordion('sec-8')" class="w-full p-4 text-left font-bold text-sm bg-slate-50 flex justify-between"><span>8. Relation Staff</span><i id="icon-sec-8" class="fas fa-chevron-down"></i></button><div id="sec-8" class="hidden p-4"><textarea class="w-full border rounded p-2" placeholder="Rapports..."></textarea></div></div>
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden"><button onclick="toggleAccordion('sec-9')" class="w-full p-4 text-left font-bold text-sm bg-slate-50 flex justify-between"><span>9. Équipe Animation</span><i id="icon-sec-9" class="fas fa-chevron-down"></i></button><div id="sec-9" class="hidden p-4"><textarea class="w-full border rounded p-2" placeholder="État d'esprit..."></textarea></div></div>
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden"><button onclick="toggleAccordion('sec-10')" class="w-full p-4 text-left font-bold text-sm bg-slate-50 flex justify-between"><span>10. Moral & Objectifs</span><i id="icon-sec-10" class="fas fa-chevron-down"></i></button><div id="sec-10" class="hidden p-4"><textarea class="w-full border rounded p-2" placeholder="Objectifs..."></textarea></div></div>
+                    <button onclick="saveHebdo()" class="w-full bg-slate-900 text-white font-bold py-3 rounded-xl shadow-lg mt-4 hover:bg-slate-800 transition">Sauvegarder le rapport</button>
                 </div>
             </div>
 
@@ -832,16 +726,8 @@
             <div id="tab-profile" class="tab-content hidden p-5 space-y-6">
                 <h2 class="text-2xl font-bold text-slate-900">Mon Profil</h2>
                 <div class="bg-white p-6 rounded-2xl shadow-card text-center">
-                    <div class="relative w-24 h-24 mx-auto mb-4 group">
-                        <img id="prof-img-preview" src="" class="w-full h-full rounded-full object-cover border-4 border-white shadow-md bg-slate-100">
-                        <div class="absolute inset-0 bg-black/40 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition cursor-pointer" onclick="document.getElementById('prof-file').click()">
-                            <i class="fas fa-camera text-white"></i>
-                        </div>
-                        <input type="file" id="prof-file" class="hidden" accept="image/*" onchange="previewImage(this)">
-                    </div>
-                    
+                    <div class="relative w-24 h-24 mx-auto mb-4 group"><img id="prof-img-preview" src="" class="w-full h-full rounded-full object-cover border-4 border-white shadow-md bg-slate-100"><div class="absolute inset-0 bg-black/40 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition cursor-pointer" onclick="document.getElementById('prof-file').click()"><i class="fas fa-camera text-white"></i></div><input type="file" id="prof-file" class="hidden" accept="image/*" onchange="previewImage(this)"></div>
                     <div class="text-xs font-bold bg-slate-100 px-3 py-1 rounded-full inline-block mb-6 uppercase" id="prof-role">...</div>
-                    
                     <div class="space-y-4 text-left">
                         <div><label class="text-xs font-bold text-slate-400">Nom</label><input type="text" id="prof-name" class="input-field mt-1"></div>
                         <div><label class="text-xs font-bold text-slate-400">Email</label><input type="email" id="prof-email" class="input-field mt-1"></div>
@@ -869,6 +755,13 @@
         <div id="modal-reporting" class="fixed inset-0 bg-slate-900/50 hidden flex items-end sm:items-center justify-center z-[70]">
             <div class="bg-white w-full sm:w-[450px] rounded-t-3xl sm:rounded-3xl p-6 max-h-[90vh] overflow-y-auto animate-slide-up">
                <h3 class="text-xl font-bold mb-4">Nouveau Reporting</h3>
+               
+               <!-- NEW CAMPING FIELD -->
+               <div class="mb-3">
+                   <label class="text-xs font-bold text-slate-400 block mb-1">Camping</label>
+                   <select id="rp-camping" class="input-field"></select>
+               </div>
+
                <input type="text" id="rp-activity" placeholder="Activité" class="input-field mb-3">
                <div class="grid grid-cols-2 gap-2 mb-3">
                    <input type="date" id="rp-date" class="input-field">
@@ -915,6 +808,18 @@
                     <input type="tel" id="camp-phone" placeholder="Téléphone" class="input-field">
                     <input type="text" id="camp-address" placeholder="Adresse" class="input-field">
                     <input type="email" id="camp-email" placeholder="Email" class="input-field">
+                    <div>
+                        <label class="text-xs font-bold text-slate-400 uppercase">Coordinateur</label>
+                        <select id="camp-coord" class="input-field mt-1 text-xs"></select>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-400 uppercase">Responsable Animation</label>
+                        <select id="camp-resp-anim" class="input-field mt-1 text-xs"></select>
+                    </div>
+                    <div>
+                        <label class="text-xs font-bold text-slate-400 uppercase">Responsable Mini-Club</label>
+                        <select id="camp-resp-mc" class="input-field mt-1 text-xs"></select>
+                    </div>
                     <div class="flex justify-end space-x-2 mt-4">
                         <button type="button" onclick="closeModal('modal-camping')" class="px-4 py-2 text-slate-500 font-bold">Annuler</button>
                         <button type="button" onclick="saveCamping()" class="px-4 py-2 bg-slate-900 text-white rounded-lg font-bold">Sauvegarder</button>
