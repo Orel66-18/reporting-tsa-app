@@ -1,0 +1,940 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Reporting TSA - App</title>
+    
+    <!-- Fonts & Icons -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                fontFamily: { sans: ['Inter', 'sans-serif'] },
+                extend: {
+                    colors: {
+                        tsa: { red: '#AE2C2B', dark: '#8a2322', bg: '#F8FAFC', surface: '#FFFFFF', text: '#0F172A', muted: '#64748B' }
+                    },
+                    boxShadow: {
+                        'card': '0 0 0 1px rgba(0,0,0,0.03), 0 2px 8px rgba(0,0,0,0.04)',
+                        'float': '0 10px 30px -5px rgba(0, 0, 0, 0.1)'
+                    },
+                    animation: {
+                        'fade-in': 'fadeIn 0.3s ease-out',
+                        'slide-up': 'slideUp 0.3s ease-out',
+                    },
+                    keyframes: {
+                        fadeIn: { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
+                        slideUp: { '0%': { transform: 'translateY(100%)' }, '100%': { transform: 'translateY(0)' } }
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <!-- Libraries -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.29/jspdf.plugin.autotable.min.js"></script>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+        import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut, updateProfile, updateEmail, updatePassword } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-auth.js";
+        import { getFirestore, collection, addDoc, setDoc, updateDoc, query, orderBy, onSnapshot, serverTimestamp, where, deleteDoc, doc, getDoc } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js";
+        import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-storage.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyCYDzlPnsMvnhrHvM4YQLMQCM5RAbrKLYE",
+            authDomain: "reporting-tsa-2026.firebaseapp.com",
+            projectId: "reporting-tsa-2026",
+            storageBucket: "reporting-tsa-2026.firebasestorage.app",
+            messagingSenderId: "511205815994",
+            appId: "1:511205815994:web:8800a2cdec1d7e1730f483",
+            measurementId: "G-7PTEYW97GB"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const storage = getStorage(app);
+        
+        let currentUser = null;
+        let currentUserProfile = null;
+        let reportingsCache = [];
+        let filteredReportings = [];
+        let campingsCache = [];
+        let usersCache = [];
+        let notificationsCache = [];
+        
+        // Listeners
+        let unsubProfile = null;
+        let unsubReportings = null;
+        let unsubUsers = null;
+        let unsubCampings = null;
+        let unsubNotifs = null;
+
+        let charts = {};
+
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                currentUser = user;
+                await loadUserProfile(user.uid);
+                showApp();
+                initRealtimeData(); 
+            } else {
+                currentUser = null;
+                currentUserProfile = null;
+                clearListeners();
+                showAuth();
+            }
+        });
+
+        async function loadUserProfile(uid) {
+            try {
+                const docSnap = await getDoc(doc(db, 'users', uid));
+                if (docSnap.exists()) {
+                    currentUserProfile = docSnap.data();
+                } else {
+                    currentUserProfile = { 
+                        role: 'animateur', camping: 'Inconnu', roleStatus: 'pending', 
+                        displayName: currentUser.displayName || 'Utilisateur', email: currentUser.email, photoURL: currentUser.photoURL
+                    };
+                }
+                updateProfileUI();
+                updateNavBasedOnRole();
+            } catch (e) { console.error("Profile load error", e); }
+        }
+
+        function clearListeners() {
+            if (unsubProfile) unsubProfile();
+            if (unsubReportings) unsubReportings();
+            if (unsubUsers) unsubUsers();
+            if (unsubCampings) unsubCampings();
+            if (unsubNotifs) unsubNotifs();
+        }
+
+        function showApp() {
+            document.getElementById('view-auth').classList.add('hidden');
+            document.getElementById('view-app').classList.remove('hidden');
+            switchTab('dashboard');
+        }
+
+        function showAuth() {
+            document.getElementById('view-auth').classList.remove('hidden');
+            document.getElementById('view-app').classList.add('hidden');
+        }
+
+        function initRealtimeData() {
+            clearListeners(); 
+            
+            unsubProfile = onSnapshot(doc(db, 'users', currentUser.uid), (docSnap) => {
+                if (docSnap.exists()) {
+                    currentUserProfile = docSnap.data();
+                    updateProfileUI();
+                    updateNavBasedOnRole();
+                }
+            });
+
+            const role = currentUserProfile?.role || 'animateur';
+            const status = currentUserProfile?.roleStatus;
+
+            let qRep = query(collection(db, 'reportings')); 
+            unsubReportings = onSnapshot(qRep, (snapshot) => {
+                const docs = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+                reportingsCache = docs.filter(r => {
+                    if (status !== 'approved' && role !== 'admin') return false; 
+                    if (['admin', 'direction', 'coordinateur'].includes(role)) return true;
+                    if (role === 'resp_animation') return r.camping === currentUserProfile.camping;
+                    if (role === 'resp_miniclub') {
+                        const mcTypes = ['Enfant', 'Mini Disco', 'Activité ludique', 'Spectacle', 'Maquillage'];
+                        return r.camping === currentUserProfile.camping && r.types && r.types.some(t => mcTypes.includes(t));
+                    }
+                    if (role === 'animateur') return r.userId === currentUser.uid;
+                    return false;
+                }).sort((a,b) => (b.date || '').localeCompare(a.date || ''));
+                
+                filteredReportings = [...reportingsCache];
+                renderDashboard();
+                renderStats();
+                calculateHebdoStats();
+            });
+
+            unsubCampings = onSnapshot(collection(db, 'campings'), (snap) => {
+                campingsCache = snap.docs.map(d => ({id: d.id, ...d.data()}));
+                renderCampingsList();
+                populateDropdowns();
+            });
+
+            if (['admin', 'direction', 'coordinateur'].includes(role)) {
+                unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
+                    usersCache = snap.docs.map(d => ({id: d.id, ...d.data()}));
+                    renderUsersList();
+                });
+            } else {
+                usersCache = [];
+            }
+
+            const qNotif = query(collection(db, 'notifications'), where('recipientId', '==', currentUser.uid));
+            unsubNotifs = onSnapshot(qNotif, (snap) => {
+                const docs = snap.docs.map(d => ({id: d.id, ...d.data()}));
+                notificationsCache = docs.sort((a, b) => (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+                const unread = notificationsCache.filter(n => !n.read).length;
+                const badge = document.getElementById('notif-badge');
+                if(badge) {
+                    badge.innerText = unread;
+                    badge.style.display = unread > 0 ? 'flex' : 'none';
+                }
+                renderNotifications();
+            });
+        }
+
+        window.deleteAllUsersExceptAdmin = async () => {
+            if (!confirm("ATTENTION : Cela va supprimer TOUS les utilisateurs sauf vous. Confirmer ?")) return;
+            const usersToDelete = usersCache.filter(u => u.id !== currentUser.uid);
+            if (usersToDelete.length === 0) return showToast("Aucun autre utilisateur.");
+            setLoading(true);
+            try {
+                const originalCache = [...usersCache];
+                usersCache = usersCache.filter(u => u.id === currentUser.uid);
+                renderUsersList();
+                const promises = usersToDelete.map(u => deleteDoc(doc(db, 'users', u.id)));
+                await Promise.all(promises);
+                showToast(`${usersToDelete.length} utilisateurs supprimés.`);
+            } catch (e) {
+                console.error(e);
+                initRealtimeData(); 
+                showToast("Erreur nettoyage : " + e.message, 'error');
+            } finally { setLoading(false); }
+        };
+
+        window.deleteUserRole = async (uid) => {
+             if (!confirm("Supprimer cet utilisateur ? Action irréversible.")) return;
+             if (currentUserProfile?.role !== 'admin') return showToast("Seul l'Admin peut supprimer.", "error");
+             const originalCache = [...usersCache];
+             usersCache = usersCache.filter(u => u.id !== uid);
+             renderUsersList();
+             try {
+                 await deleteDoc(doc(db, 'users', uid));
+                 showToast("Utilisateur supprimé");
+             } catch(e) { 
+                 console.error(e);
+                 usersCache = originalCache;
+                 renderUsersList();
+                 showToast("Erreur: " + e.message, 'error'); 
+             }
+        };
+
+        window.handleLogin = async (e) => {
+            e.preventDefault();
+            setLoading(true);
+            try {
+                await signInWithEmailAndPassword(auth, document.getElementById('email').value, document.getElementById('password').value);
+                showToast('Connexion réussie', 'success');
+            } catch (error) { showToast(error.message, 'error'); } 
+            finally { setLoading(false); }
+        };
+
+        window.handleRegister = async (e) => {
+            e.preventDefault();
+            setLoading(true);
+            try {
+                const email = document.getElementById('reg-email').value;
+                const password = document.getElementById('reg-password').value;
+                const name = document.getElementById('reg-name').value;
+                const role = document.getElementById('reg-role').value;
+                const camping = document.getElementById('reg-camping').value;
+                const isMiniClub = document.getElementById('reg-miniclub-check').checked;
+
+                if(!role || !camping) throw new Error("Veuillez remplir tous les champs.");
+
+                const userCred = await createUserWithEmailAndPassword(auth, email, password);
+                await updateProfile(userCred.user, { displayName: name });
+                
+                await setDoc(doc(db, 'users', userCred.user.uid), {
+                    uid: userCred.user.uid, email: userCred.user.email, displayName: name, camping: camping, role: role, roleStatus: 'pending', isMiniClub: isMiniClub, createdAt: serverTimestamp()
+                });
+                
+                await addNotification('admin_group', 'Nouveau compte', `${name} (${role}) attend validation.`, 'users');
+                showToast('Compte créé ! En attente de validation.', 'success');
+            } catch (error) { showToast(error.message, 'error'); } 
+            finally { setLoading(false); }
+        };
+
+        window.handleAdminDemo = async () => {
+            setLoading(true);
+            try {
+                const email = "regisseur@team-spirit-animation.fr";
+                const password = "Admin1234!"; 
+                try { await signInWithEmailAndPassword(auth, email, password); } 
+                catch (loginError) {
+                    if (loginError.code === 'auth/user-not-found' || loginError.code === 'auth/invalid-credential') {
+                        const userCred = await createUserWithEmailAndPassword(auth, email, password);
+                        await updateProfile(userCred.user, { displayName: "Admin Régisseur" });
+                    } else { throw loginError; }
+                }
+                await setDoc(doc(db, 'users', auth.currentUser.uid), {
+                    uid: auth.currentUser.uid, email: email, displayName: "Admin Régisseur", camping: "Siège TSA", role: 'admin', roleStatus: 'approved', lastLogin: serverTimestamp()
+                }, { merge: true });
+                showToast('Mode Admin activé', 'success');
+            } catch (error) { showToast("Erreur Admin: " + error.message, 'error'); } 
+            finally { setLoading(false); }
+        };
+
+        window.handleLogout = () => signOut(auth);
+
+        window.updateRoleStatus = async (uid, newStatus) => {
+            try {
+                await updateDoc(doc(db, 'users', uid), { roleStatus: newStatus });
+                showToast(`Utilisateur ${newStatus}`);
+            } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        window.saveCamping = async () => {
+            const id = document.getElementById('camp-id').value;
+            const data = {
+                name: document.getElementById('camp-name').value,
+                directorName: document.getElementById('camp-director').value,
+                phone: document.getElementById('camp-phone').value,
+                address: document.getElementById('camp-address').value,
+                email: document.getElementById('camp-email').value,
+            };
+            try {
+                if (id) await updateDoc(doc(db, 'campings', id), data);
+                else await addDoc(collection(db, 'campings'), data);
+                closeModal('modal-camping');
+                showToast('Camping enregistré');
+            } catch (e) { showToast(e.message, 'error'); }
+        };
+
+        window.submitReporting = async () => {
+             const selectedTypes = Array.from(document.querySelectorAll('.type-chip.selected')).map(el => el.dataset.value);
+             if(selectedTypes.length === 0) return showToast("Sélectionnez au moins un type", "error");
+             
+             await addDoc(collection(db, 'reportings'), {
+                 userId: currentUser.uid, userName: currentUserProfile.displayName, activityName: document.getElementById('rp-activity').value,
+                 date: document.getElementById('rp-date').value, startTime: document.getElementById('rp-start').value, endTime: document.getElementById('rp-end').value,
+                 participants: parseInt(document.getElementById('rp-participants').value), types: selectedTypes, camping: currentUserProfile.camping || "Inconnu", createdAt: serverTimestamp()
+             });
+             closeModal('modal-reporting');
+             showToast('Reporting enregistré !');
+        };
+
+        window.previewImage = (input) => {
+            if (input.files && input.files[0]) {
+                const reader = new FileReader();
+                reader.onload = (e) => document.getElementById('prof-img-preview').src = e.target.result;
+                reader.readAsDataURL(input.files[0]);
+            }
+        };
+
+        window.saveProfileFull = async () => {
+            setLoading(true);
+            const name = document.getElementById('prof-name').value;
+            const email = document.getElementById('prof-email').value;
+            const camping = document.getElementById('prof-camping').value;
+            const newPwd = document.getElementById('prof-pwd').value;
+            const file = document.getElementById('prof-file').files[0];
+            try {
+                let updates = {};
+                let authUpdates = {};
+                if (file) {
+                    const storageRef = ref(storage, `profile_photos/${currentUser.uid}`);
+                    await uploadBytes(storageRef, file);
+                    const photoURL = await getDownloadURL(storageRef);
+                    updates.photoURL = photoURL;
+                    authUpdates.photoURL = photoURL;
+                }
+                if (email !== currentUser.email) { await updateEmail(currentUser, email); updates.email = email; }
+                if (newPwd) await updatePassword(currentUser, newPwd);
+                if (name !== currentUserProfile.displayName) { updates.displayName = name; authUpdates.displayName = name; }
+                if (!document.getElementById('prof-camping').disabled) updates.camping = camping;
+                if (Object.keys(authUpdates).length > 0) await updateProfile(currentUser, authUpdates);
+                if (Object.keys(updates).length > 0) await updateDoc(doc(db, 'users', currentUser.uid), updates);
+                showToast("Profil mis à jour !", "success");
+                document.getElementById('prof-pwd').value = ""; 
+            } catch (error) {
+                console.error(error);
+                if (error.code === 'auth/requires-recent-login') { showToast("Reconnexion requise pour modifier email/mdp", "error"); setTimeout(() => handleLogout(), 2000); } 
+                else { showToast(error.message, "error"); }
+            } finally { setLoading(false); }
+        };
+
+        // --- UI UTILS ---
+        function updateProfileUI() { 
+            if(currentUserProfile) {
+                document.getElementById('user-name-display').innerText = currentUserProfile.displayName;
+                document.getElementById('user-camping-display').innerText = currentUserProfile.camping;
+                document.getElementById('prof-name').value = currentUserProfile.displayName || '';
+                document.getElementById('prof-email').value = currentUserProfile.email || '';
+                document.getElementById('prof-role').innerText = (currentUserProfile.role || '').toUpperCase();
+                const pCamp = document.getElementById('prof-camping');
+                pCamp.value = currentUserProfile.camping;
+                pCamp.disabled = !['admin', 'coordinateur'].includes(currentUserProfile.role);
+                const imgUrl = currentUserProfile.photoURL || `https://ui-avatars.com/api/?name=${currentUserProfile.displayName}&background=random`;
+                document.getElementById('prof-img-preview').src = imgUrl;
+            }
+        }
+
+        function renderUsersList() {
+            const container = document.getElementById('users-list');
+            if (!container) return;
+            
+            const myRole = currentUserProfile ? currentUserProfile.role : '';
+            const isAdmin = myRole === 'admin';
+            
+            const purgeBtn = document.getElementById('btn-purge-users');
+            if (purgeBtn) purgeBtn.style.display = isAdmin ? 'block' : 'none';
+
+            container.innerHTML = usersCache.length ? usersCache.map(u => {
+                const statusColor = u.roleStatus === 'approved' ? 'text-green-500' : 'text-orange-500';
+                const canValidate = isAdmin || (myRole === 'coordinateur' && ['resp_animation', 'resp_miniclub'].includes(u.role));
+                
+                return `
+                <div class="flex items-center justify-between bg-white p-3 rounded-xl border border-slate-100 mb-2 animate-fade-in">
+                    <div class="flex items-center space-x-3">
+                        <img src="${u.photoURL || 'https://ui-avatars.com/api/?name='+u.displayName+'&background=f1f5f9&color=64748b'}" class="w-10 h-10 rounded-full object-cover border border-slate-200">
+                        <div>
+                            <p class="font-bold text-sm text-slate-800">${u.displayName}</p>
+                            <p class="text-[10px] text-slate-500 uppercase">${u.role} (${u.camping})</p>
+                        </div>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <i class="fas fa-circle text-[8px] ${statusColor} mr-2"></i>
+                        ${u.roleStatus === 'pending' && canValidate ? `
+                            <button onclick="updateRoleStatus('${u.id}', 'approved')" class="text-green-600 bg-green-50 p-1.5 rounded hover:bg-green-100"><i class="fas fa-check"></i></button>
+                            <button onclick="updateRoleStatus('${u.id}', 'rejected')" class="text-red-600 bg-red-50 p-1.5 rounded hover:bg-red-100"><i class="fas fa-times"></i></button>
+                        ` : ''}
+                        ${isAdmin ? `<button onclick="deleteUserRole('${u.id}')" class="text-slate-300 hover:text-red-500 p-1.5 transition"><i class="fas fa-trash"></i></button>` : ''}
+                    </div>
+                </div>`;
+            }).join('') : '<p class="text-center text-sm text-slate-400 p-4">Aucun utilisateur</p>';
+        }
+
+        function updateNavBasedOnRole() {
+            const role = currentUserProfile?.role;
+            const status = currentUserProfile?.roleStatus;
+            ['nav-stats', 'nav-hebdo', 'nav-campings', 'nav-users'].forEach(id => document.getElementById(id).classList.add('hidden'));
+            if (status !== 'approved' && role !== 'admin') return;
+            if (['admin', 'direction', 'coordinateur'].includes(role)) {
+                ['nav-stats', 'nav-hebdo', 'nav-campings', 'nav-users'].forEach(id => document.getElementById(id).classList.remove('hidden'));
+            } else if (role === 'resp_animation') {
+                document.getElementById('nav-stats').classList.remove('hidden');
+                document.getElementById('nav-hebdo').classList.remove('hidden');
+            } else if (role === 'resp_miniclub') {
+                document.getElementById('nav-stats').classList.remove('hidden');
+            }
+        }
+
+        function populateDropdowns() {
+            const options = campingsCache.map(c => `<option value="${c.name}">${c.name}</option>`).join('');
+            const s1 = document.getElementById('reg-camping');
+            const s2 = document.getElementById('prof-camping');
+            const s3 = document.getElementById('stat-filter-camping');
+            if(s1) s1.innerHTML = `<option disabled selected>Choisir un camping...</option>` + options;
+            if(s2) { const old = s2.value; s2.innerHTML = options; if(old) s2.value = old; }
+            if(s3) s3.innerHTML = `<option value="all">Tous les campings</option>` + options;
+        }
+
+        async function addNotification(targetId, title, body, type='info') {
+            await addDoc(collection(db, 'notifications'), { recipientId: targetId, title, body, type, read: false, createdAt: serverTimestamp() });
+        }
+
+        function formatDate(d) { return d ? new Date(d).toLocaleDateString('fr-FR') : ''; }
+        function setLoading(bool) { document.querySelector('.loading-overlay').style.display = bool ? 'flex' : 'none'; }
+        
+        function showToast(msg, type='success') {
+            const t = document.createElement('div');
+            t.className = `fixed top-4 right-4 text-white px-6 py-4 rounded-xl shadow-xl z-[100] animate-fade-in flex items-center text-sm font-medium ${type==='success'?'bg-slate-900':'bg-red-600'}`;
+            t.innerHTML = `<span>${msg}</span>`;
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), 3000);
+        }
+
+        function calculateHebdoStats() {
+            const stats = { aquatic: 0, sport: 0, nature: 0, fitness: 0, apero: 0, artistic: 0, theme: 0, minidisco: 0, dance: 0, other_evening: 0 };
+            reportingsCache.forEach(rp => {
+                const p = rp.participants || 0;
+                if (!rp.types) return;
+                rp.types.forEach(t => {
+                    if (['AquaGym'].includes(t)) stats.aquatic += p;
+                    if (['Sport', 'Activité ludique'].includes(t)) stats.sport += p;
+                    if (['Sortie extérieur'].includes(t)) stats.nature += p;
+                    if (['Fitness'].includes(t)) stats.fitness += p;
+                    if (['Jeux apéro', 'Jeux café'].includes(t)) stats.apero += p;
+                    if (['Concert', 'Spectacle', 'Concert'].includes(t)) stats.artistic += p;
+                    if (['Soirée'].includes(t)) stats.theme += p;
+                    if (['Mini Disco'].includes(t)) stats.minidisco += p;
+                    if (['Autre'].includes(t)) stats.other_evening += p;
+                });
+            });
+            const setVal = (id, val) => { const el = document.getElementById(id); if(el) el.value = val; };
+            setVal('hebdo-aqua-nb', stats.aquatic);
+            setVal('hebdo-sport-nb', stats.sport);
+            setVal('hebdo-nature-nb', stats.nature);
+            setVal('hebdo-fitness-nb', stats.fitness);
+            setVal('hebdo-apero-nb', stats.apero);
+            setVal('hebdo-art-nb', stats.artistic);
+            setVal('hebdo-soiree-nb', stats.theme);
+            setVal('hebdo-minidisco-nb', stats.minidisco);
+            setVal('hebdo-danse-nb', stats.dance);
+            setVal('hebdo-autre-nb', stats.other_evening);
+        }
+
+        function renderDashboard() { 
+            const listEl = document.getElementById('reporting-list');
+            if(!listEl) return;
+            const total = reportingsCache.reduce((acc, curr) => acc + (curr.participants || 0), 0);
+            document.getElementById('kpi-week-total').innerText = total;
+            listEl.innerHTML = reportingsCache.slice(0, 10).map(rp => `
+                <div class="bg-white p-3 rounded-xl border border-slate-100 shadow-sm flex justify-between items-center mb-2">
+                    <div><p class="font-bold text-sm text-slate-800">${rp.activityName}</p><p class="text-xs text-slate-400">${formatDate(rp.date)}</p></div>
+                    <span class="font-bold text-lg text-slate-800">${rp.participants}</span>
+                </div>
+            `).join('') || '<div class="text-center text-xs text-slate-400 py-4">Historique vide</div>';
+        }
+        function renderNotifications() { /* ... */ }
+        function renderCampingsList() { 
+            const container = document.getElementById('campings-grid');
+            if (!container) return;
+            container.innerHTML = campingsCache.map(c => `
+                <div class="bg-white p-4 rounded-xl border border-slate-100 shadow-sm flex flex-col justify-between">
+                    <div><h3 class="font-bold text-slate-800 text-lg">${c.name}</h3><p class="text-xs text-slate-500"><i class="fas fa-user-tie mr-1"></i> ${c.directorName}</p></div>
+                    <div class="mt-3 pt-3 border-t border-slate-50 flex justify-end"><button onclick="editCamping('${c.id}')" class="text-tsa-red text-xs font-bold uppercase">Modifier</button></div>
+                </div>
+            `).join('');
+        }
+        
+        function renderStats() {
+            const ctxPie = document.getElementById('chart-types');
+            const ctxLine = document.getElementById('chart-time');
+            if (!ctxPie || !ctxLine) return;
+
+            const total = filteredReportings.reduce((acc, r) => acc + (r.participants || 0), 0);
+            const count = filteredReportings.length;
+            const avg = count > 0 ? Math.round(total / count) : 0;
+            
+            document.getElementById('stat-total').innerText = total;
+            document.getElementById('stat-count').innerText = count;
+            document.getElementById('stat-avg').innerText = avg;
+
+            const statsByType = {};
+            filteredReportings.forEach(rp => { if(rp.types) rp.types.forEach(t => statsByType[t] = (statsByType[t] || 0) + rp.participants); });
+
+            if (charts.pie) charts.pie.destroy();
+            charts.pie = new Chart(ctxPie, {
+                type: 'doughnut',
+                data: { labels: Object.keys(statsByType), datasets: [{ data: Object.values(statsByType), backgroundColor: ['#AE2C2B', '#3B82F6', '#10B981', '#F59E0B', '#8B5CF6'], borderWidth: 1 }] },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { boxWidth: 12, font: {size: 10} } } } }
+            });
+
+            const statsByDate = {};
+            filteredReportings.forEach(rp => { statsByDate[rp.date] = (statsByDate[rp.date] || 0) + rp.participants; });
+            const sortedDates = Object.keys(statsByDate).sort();
+            const dataPoints = sortedDates.map(d => statsByDate[d]);
+
+            if (charts.line) charts.line.destroy();
+            charts.line = new Chart(ctxLine, {
+                type: 'line',
+                data: { labels: sortedDates.map(d => formatDate(d)), datasets: [{ label: 'Participants', data: dataPoints, borderColor: '#AE2C2B', backgroundColor: 'rgba(174, 44, 43, 0.1)', fill: true, tension: 0.3 }] },
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+            });
+        }
+
+        // --- GLOBAL EXPORTS ---
+        window.switchTab = (tabId) => {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+            document.getElementById('tab-' + tabId).classList.remove('hidden');
+            const navLinks = document.querySelectorAll('.nav-link');
+            navLinks.forEach(l => l.classList.toggle('text-tsa-red', l.dataset.target === tabId));
+            navLinks.forEach(l => l.classList.toggle('text-slate-400', l.dataset.target !== tabId));
+            if(tabId === 'stats') setTimeout(renderStats, 100);
+            if(tabId === 'hebdo') calculateHebdoStats();
+        };
+        window.openModal = (id) => { document.getElementById(id).classList.remove('hidden'); if(id === 'modal-reporting') { const d = document.getElementById('rp-date'); if(d) d.valueAsDate = new Date(); } };
+        window.closeModal = (id) => document.getElementById(id).classList.add('hidden');
+        window.changeParticipants = (d) => { const i = document.getElementById('rp-participants'); i.value = Math.max(0, (parseInt(i.value)||0) + d); };
+        window.toggleAccordion = (id) => { const el = document.getElementById(id); el.classList.toggle('hidden'); const icon = document.getElementById('icon-' + id); if(icon) { icon.classList.toggle('fa-chevron-down'); icon.classList.toggle('fa-chevron-up'); } };
+        window.toggleAuthMode = () => { document.getElementById('form-login').classList.toggle('hidden'); document.getElementById('form-register').classList.toggle('hidden'); };
+        window.toggleNotifPanel = () => document.getElementById('notif-panel').classList.toggle('hidden');
+        window.toggleChip = (el) => { if (el.classList.contains('selected')) { el.classList.remove('selected', 'bg-tsa-red', 'text-white', 'border-transparent'); el.classList.add('bg-white', 'text-slate-600', 'border-slate-200'); } else { el.classList.add('selected', 'bg-tsa-red', 'text-white', 'border-transparent'); el.classList.remove('bg-white', 'text-slate-600', 'border-slate-200'); } };
+        window.editCamping = (id) => { const c = campingsCache.find(x => x.id === id); if (!c) return; document.getElementById('camp-id').value = c.id; document.getElementById('camp-name').value = c.name; document.getElementById('camp-director').value = c.directorName; document.getElementById('camp-phone').value = c.phone; document.getElementById('camp-address').value = c.address; document.getElementById('camp-email').value = c.email; openModal('modal-camping'); };
+        window.applyStatsFilters = () => { /* ... */ };
+        window.exportExcel = () => { /* ... */ };
+        window.exportPDF = async () => { /* ... */ };
+        window.markNotifRead = async (id) => { await updateDoc(doc(db, 'notifications', id), { read: true }); };
+
+    </script>
+</head>
+<body class="bg-tsa-bg text-tsa-text font-sans h-screen overflow-hidden select-none">
+
+    <!-- LOADING -->
+    <div class="loading-overlay fixed inset-0 bg-white/80 backdrop-blur-sm z-[200] hidden items-center justify-center flex-col">
+        <div class="w-12 h-12 border-4 border-tsa-red border-t-transparent rounded-full animate-spin mb-4"></div>
+        <p class="text-sm font-semibold text-slate-500">Chargement...</p>
+    </div>
+
+    <!-- AUTH -->
+    <div id="view-auth" class="min-h-screen flex flex-col items-center justify-center px-6 bg-white hidden overflow-y-auto py-10">
+        <div class="w-20 h-20 bg-tsa-red rounded-2xl flex items-center justify-center text-white text-3xl font-bold mb-8 shadow-xl rotate-3 shrink-0">T</div>
+        <h1 class="text-3xl font-bold text-slate-900 mb-2 shrink-0">Bienvenue</h1>
+        <div class="w-full max-w-sm shrink-0">
+            <form id="form-login" onsubmit="handleLogin(event)" class="space-y-5">
+                <input type="email" id="email" required class="input-field" placeholder="Email">
+                <input type="password" id="password" required class="input-field" placeholder="Mot de passe">
+                <button type="submit" class="btn-primary">Se connecter</button>
+                <button type="button" onclick="handleAdminDemo()" class="btn-secondary mt-4">Mode Admin (Démo)</button>
+            </form>
+            <form id="form-register" onsubmit="handleRegister(event)" class="space-y-4 hidden">
+                <input type="text" id="reg-name" required class="input-field" placeholder="Nom Complet">
+                <select id="reg-role" class="input-field" onchange="this.value==='animateur' ? document.getElementById('mc-box').classList.remove('hidden') : document.getElementById('mc-box').classList.add('hidden')">
+                    <option value="" disabled selected>Choisir un poste...</option>
+                    <option value="direction">Direction</option>
+                    <option value="coordinateur">Coordinateur</option>
+                    <option value="resp_animation">Responsable Animation</option>
+                    <option value="resp_miniclub">Responsable Mini Club</option>
+                    <option value="animateur">Animateur</option>
+                </select>
+                <div id="mc-box" class="hidden flex items-center space-x-2 px-2">
+                    <input type="checkbox" id="reg-miniclub-check" class="accent-tsa-red w-5 h-5">
+                    <label class="text-sm text-slate-600">Je fais du Mini-Club</label>
+                </div>
+                <select id="reg-camping" class="input-field"><option disabled selected>Chargement...</option></select>
+                <input type="email" id="reg-email" required class="input-field" placeholder="Email">
+                <input type="password" id="reg-password" required class="input-field" placeholder="Mot de passe">
+                <button type="submit" class="btn-primary">Créer mon compte</button>
+            </form>
+            <div class="mt-6 text-center"><button onclick="toggleAuthMode()" class="text-sm text-slate-500 underline">Basculer Connexion / Inscription</button></div>
+        </div>
+    </div>
+
+    <!-- APP VIEW -->
+    <div id="view-app" class="h-full flex flex-col hidden relative">
+        <header class="bg-white/90 backdrop-blur-md border-b border-slate-100 z-50 flex-none h-16 flex items-center justify-between px-5 sticky top-0">
+            <h1 class="text-base font-bold text-slate-800">Reporting TSA</h1>
+            <div class="relative cursor-pointer w-9 h-9 flex items-center justify-center rounded-full hover:bg-slate-50" onclick="toggleNotifPanel()">
+                <i class="fas fa-bell text-slate-400 text-lg"></i>
+                <span id="notif-badge" class="absolute top-2 right-2 bg-red-500 border-2 border-white rounded-full h-2.5 w-2.5 hidden"></span>
+            </div>
+            <div id="notif-panel" class="absolute top-16 right-2 w-64 bg-white shadow-xl rounded-xl border border-slate-100 hidden z-[60] max-h-64 overflow-y-auto">
+                <div class="p-3 border-b border-slate-50 font-bold text-xs text-slate-400 uppercase">Notifications</div>
+                <div id="notif-list"></div>
+            </div>
+        </header>
+
+        <main class="flex-1 overflow-y-auto pb-28 bg-tsa-bg">
+            
+            <!-- DASHBOARD -->
+            <div id="tab-dashboard" class="tab-content p-5 space-y-6">
+                <div>
+                    <h2 class="text-2xl font-bold text-slate-900">Bonjour, <span id="user-name-display" class="text-tsa-red">...</span></h2>
+                    <p class="text-sm text-slate-500"><i class="fas fa-map-pin mr-1"></i><span id="user-camping-display">...</span></p>
+                </div>
+                <button onclick="openModal('modal-reporting')" class="btn-big-action"><span>Nouveau Reporting</span><i class="fas fa-plus bg-white/20 p-2 rounded-full"></i></button>
+                <div class="grid grid-cols-2 gap-4">
+                    <div class="card-kpi"><i class="fas fa-users text-tsa-red"></i><span id="kpi-week-total" class="text-2xl font-bold block mt-2">0</span><span class="text-xs text-slate-400">Participants</span></div>
+                    <div class="card-kpi" onclick="switchTab('hebdo')"><i class="fas fa-file-contract text-orange-500"></i><span class="text-sm font-bold block mt-2">Rapport Hebdo</span><span class="text-xs text-slate-400">Accéder</span></div>
+                </div>
+                <div class="mt-4">
+                    <h3 class="font-bold text-lg mb-2">Activités Récentes</h3>
+                    <div id="reporting-list" class="space-y-2"></div>
+                </div>
+            </div>
+
+            <!-- CAMPINGS (Admin/Coordo) -->
+            <div id="tab-campings" class="tab-content hidden p-5 space-y-4">
+                <div class="flex justify-between items-center">
+                    <h2 class="text-2xl font-bold text-slate-900">Campings</h2>
+                    <!-- NOUVEAU BOUTON CLAIR -->
+                    <button onclick="openModal('modal-camping'); document.getElementById('form-camping').reset(); document.getElementById('camp-id').value='';" class="bg-slate-900 text-white px-4 py-2 rounded-lg shadow-lg flex items-center text-sm font-bold">
+                        <i class="fas fa-plus mr-2"></i> Ajouter
+                    </button>
+                </div>
+                <div id="campings-grid" class="grid grid-cols-1 gap-3"></div>
+            </div>
+
+            <!-- UTILISATEURS (Admin/Coordo) -->
+            <div id="tab-users" class="tab-content hidden p-5 space-y-4">
+                <h2 class="text-2xl font-bold text-slate-900">Utilisateurs</h2>
+                <div class="flex justify-end mb-4">
+                    <button id="btn-purge-users" onclick="deleteAllUsersExceptAdmin()" class="bg-red-100 text-red-600 px-3 py-1 rounded-lg text-xs font-bold border border-red-200 hidden hover:bg-red-200 transition">
+                        <i class="fas fa-trash-alt mr-1"></i> Tout purger
+                    </button>
+                </div>
+                <div id="users-list" class="space-y-2">
+                    <div class="text-center p-4 text-slate-400 text-sm animate-pulse">Chargement des utilisateurs...</div>
+                </div>
+            </div>
+
+            <!-- STATS -->
+            <div id="tab-stats" class="tab-content hidden p-5 space-y-6">
+                <h2 class="text-2xl font-bold text-slate-900">Statistiques</h2>
+                
+                <!-- Filters -->
+                <div class="bg-white p-4 rounded-xl shadow-sm border border-slate-100">
+                    <p class="text-xs font-bold text-slate-400 uppercase mb-2">Filtres</p>
+                    <div class="grid grid-cols-2 gap-2 mb-3">
+                        <select id="stat-filter-camping" class="input-field text-xs p-2">
+                            <option value="all">Tous les campings</option>
+                        </select>
+                        <select id="stat-filter-type" class="input-field text-xs p-2">
+                            <option value="all">Toutes activités</option>
+                            <option value="Sport">Sport</option>
+                            <option value="Enfant">Enfant</option>
+                            <option value="Soirée">Soirée</option>
+                            <option value="Fitness">Fitness</option>
+                            <option value="AquaGym">AquaGym</option>
+                        </select>
+                        <input type="date" id="stat-filter-start" class="input-field text-xs p-2">
+                        <input type="date" id="stat-filter-end" class="input-field text-xs p-2">
+                    </div>
+                    <button onclick="applyStatsFilters()" class="w-full bg-slate-800 text-white py-2 rounded-lg text-xs font-bold">Appliquer les filtres</button>
+                </div>
+
+                <!-- KPIs Grid -->
+                <div class="grid grid-cols-3 gap-2">
+                    <div class="bg-white p-3 rounded-xl border border-slate-100 text-center">
+                        <p class="text-[10px] text-slate-400 uppercase font-bold">Total</p>
+                        <p id="stat-total" class="text-xl font-bold text-tsa-red">0</p>
+                    </div>
+                    <div class="bg-white p-3 rounded-xl border border-slate-100 text-center">
+                        <p class="text-[10px] text-slate-400 uppercase font-bold">Activités</p>
+                        <p id="stat-count" class="text-xl font-bold text-slate-800">0</p>
+                    </div>
+                    <div class="bg-white p-3 rounded-xl border border-slate-100 text-center">
+                        <p class="text-[10px] text-slate-400 uppercase font-bold">Moyenne</p>
+                        <p id="stat-avg" class="text-xl font-bold text-slate-800">0</p>
+                    </div>
+                </div>
+
+                <!-- Charts Grid -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div class="bg-white p-4 rounded-xl shadow-card h-64 relative">
+                        <h4 class="text-xs font-bold text-slate-400 mb-2">Répartition Types</h4>
+                        <div class="h-48 relative"><canvas id="chart-types"></canvas></div>
+                    </div>
+                    <div class="bg-white p-4 rounded-xl shadow-card h-64 relative">
+                        <h4 class="text-xs font-bold text-slate-400 mb-2">Évolution Temporelle</h4>
+                        <div class="h-48 relative"><canvas id="chart-time"></canvas></div>
+                    </div>
+                </div>
+
+                <!-- Actions -->
+                <div class="flex space-x-3">
+                    <button onclick="exportPDF()" class="flex-1 bg-red-600 text-white py-3 rounded-xl font-bold shadow-lg text-sm flex items-center justify-center">
+                        <i class="fas fa-file-pdf mr-2"></i> Export PDF
+                    </button>
+                    <button onclick="exportExcel()" class="flex-1 bg-green-600 text-white py-3 rounded-xl font-bold shadow-lg text-sm flex items-center justify-center">
+                        <i class="fas fa-file-excel mr-2"></i> Export Excel
+                    </button>
+                </div>
+            </div>
+
+            <!-- HEBDO (11 SECTIONS) -->
+            <div id="tab-hebdo" class="tab-content hidden p-5 space-y-4">
+                <h2 class="text-2xl font-bold text-slate-900">Rapport Hebdo</h2>
+                <div class="bg-blue-50 p-4 rounded-lg text-xs text-blue-800 mb-4">Les données sont pré-remplies.</div>
+                
+                <div class="space-y-3">
+                    <!-- SECTION 1 -->
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <button onclick="toggleAccordion('sec-1')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm">
+                            <span>1. Participations Journée</span>
+                            <i id="icon-sec-1" class="fas fa-chevron-down text-slate-400"></i>
+                        </button>
+                        <div id="sec-1" class="hidden p-4 space-y-4 text-sm">
+                            <div class="grid gap-2">
+                                <label class="text-xs font-bold text-slate-500">Aquatique / Sport / Nature / Fitness / Apéro / Artistique</label>
+                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Aquatique</span><input type="number" id="hebdo-aqua-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
+                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Sport</span><input type="number" id="hebdo-sport-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
+                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Nature</span><input type="number" id="hebdo-nature-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
+                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Fitness</span><input type="number" id="hebdo-fitness-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
+                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Apéro</span><input type="number" id="hebdo-apero-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
+                                <div class="flex space-x-2"><span class="w-20 text-xs py-2">Artistique</span><input type="number" id="hebdo-art-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- SECTION 2 -->
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <button onclick="toggleAccordion('sec-2')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm">
+                            <span>2. Participations Soirées</span>
+                            <i id="icon-sec-2" class="fas fa-chevron-down text-slate-400"></i>
+                        </button>
+                        <div id="sec-2" class="hidden p-4 space-y-4 text-sm">
+                             <div class="flex space-x-2"><span class="w-20 text-xs py-2">Thème</span><input type="number" id="hebdo-soiree-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
+                             <div class="flex space-x-2"><span class="w-20 text-xs py-2">Mini-Disco</span><input type="number" id="hebdo-minidisco-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
+                             <div class="flex space-x-2"><span class="w-20 text-xs py-2">Dansante</span><input type="number" id="hebdo-danse-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
+                             <div class="flex space-x-2"><span class="w-20 text-xs py-2">Autres</span><input type="number" id="hebdo-autre-nb" class="w-16 border rounded text-center bg-slate-50" readonly><input type="text" placeholder="Obs..." class="flex-1 border rounded px-2"></div>
+                        </div>
+                    </div>
+
+                    <!-- SECTION 3 -->
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <button onclick="toggleAccordion('sec-3')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>3. Retour Général</span><i id="icon-sec-3" class="fas fa-chevron-down text-slate-400"></i></button>
+                        <div id="sec-3" class="hidden p-4 space-y-2 text-sm"><textarea class="w-full border rounded p-2" placeholder="Bilan global..."></textarea><textarea class="w-full border rounded p-2" placeholder="Commentaires généraux..."></textarea></div>
+                    </div>
+
+                    <!-- SECTION 4 -->
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <button onclick="toggleAccordion('sec-4')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>4. Animations Proposées</span><i id="icon-sec-4" class="fas fa-chevron-down text-slate-400"></i></button>
+                        <div id="sec-4" class="hidden p-4 space-y-2 text-sm"><textarea class="w-full border rounded p-2" placeholder="Animations proposées..."></textarea><textarea class="w-full border rounded p-2" placeholder="Retours vacanciers..."></textarea></div>
+                    </div>
+
+                    <!-- SECTION 5 -->
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <button onclick="toggleAccordion('sec-5')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>5. Ressources (Journalier)</span><i id="icon-sec-5" class="fas fa-chevron-down text-slate-400"></i></button>
+                        <div id="sec-5" class="hidden p-4 text-sm"><textarea class="w-full border rounded p-2 h-32" placeholder="Samedi: ... Dimanche: ..."></textarea></div>
+                    </div>
+
+                    <!-- SECTION 6 -->
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <button onclick="toggleAccordion('sec-6')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>6. Mini-Club</span><i id="icon-sec-6" class="fas fa-chevron-down text-slate-400"></i></button>
+                        <div id="sec-6" class="hidden p-4 text-sm space-y-2">
+                            <label><input type="checkbox"> Éducatives</label>
+                            <label><input type="checkbox"> Spectacles</label>
+                            <label><input type="checkbox"> Grands Jeux</label>
+                            <textarea class="w-full border rounded p-2" placeholder="Bilan enfants..."></textarea>
+                        </div>
+                    </div>
+
+                    <!-- SECTION 7 -->
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <button onclick="toggleAccordion('sec-7')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>7. Signalétiques & Infra</span><i id="icon-sec-7" class="fas fa-chevron-down text-slate-400"></i></button>
+                        <div id="sec-7" class="hidden p-4 text-sm"><textarea class="w-full border rounded p-2" placeholder="État logement, matériel, scène..."></textarea></div>
+                    </div>
+
+                    <!-- SECTION 8 -->
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <button onclick="toggleAccordion('sec-8')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>8. Relation Staff</span><i id="icon-sec-8" class="fas fa-chevron-down text-slate-400"></i></button>
+                        <div id="sec-8" class="hidden p-4 text-sm"><textarea class="w-full border rounded p-2" placeholder="Rapports avec Direction, Réception, Technique..."></textarea></div>
+                    </div>
+
+                    <!-- SECTION 9 -->
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <button onclick="toggleAccordion('sec-9')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>9. Équipe Animation</span><i id="icon-sec-9" class="fas fa-chevron-down text-slate-400"></i></button>
+                        <div id="sec-9" class="hidden p-4 text-sm"><textarea class="w-full border rounded p-2" placeholder="État d'esprit des membres..."></textarea></div>
+                    </div>
+
+                    <!-- SECTION 10 & 11 -->
+                    <div class="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <button onclick="toggleAccordion('sec-10')" class="w-full flex justify-between items-center p-4 bg-slate-50 text-left font-bold text-slate-800 text-sm"><span>10. Moral & 11. Objectifs</span><i id="icon-sec-10" class="fas fa-chevron-down text-slate-400"></i></button>
+                        <div id="sec-10" class="hidden p-4 text-sm space-y-2"><textarea class="w-full border rounded p-2" placeholder="Moral général..."></textarea><textarea class="w-full border rounded p-2" placeholder="Objectifs semaine prochaine..."></textarea></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- PROFIL -->
+            <div id="tab-profile" class="tab-content hidden p-5 space-y-6">
+                <h2 class="text-2xl font-bold text-slate-900">Mon Profil</h2>
+                <div class="bg-white p-6 rounded-2xl shadow-card text-center">
+                    <div class="relative w-24 h-24 mx-auto mb-4 group">
+                        <img id="prof-img-preview" src="" class="w-full h-full rounded-full object-cover border-4 border-white shadow-md bg-slate-100">
+                        <div class="absolute inset-0 bg-black/40 rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition cursor-pointer" onclick="document.getElementById('prof-file').click()">
+                            <i class="fas fa-camera text-white"></i>
+                        </div>
+                        <input type="file" id="prof-file" class="hidden" accept="image/*" onchange="previewImage(this)">
+                    </div>
+                    
+                    <div class="text-xs font-bold bg-slate-100 px-3 py-1 rounded-full inline-block mb-6 uppercase" id="prof-role">...</div>
+                    
+                    <div class="space-y-4 text-left">
+                        <div><label class="text-xs font-bold text-slate-400">Nom</label><input type="text" id="prof-name" class="input-field mt-1"></div>
+                        <div><label class="text-xs font-bold text-slate-400">Email</label><input type="email" id="prof-email" class="input-field mt-1"></div>
+                        <div><label class="text-xs font-bold text-slate-400">Nouveau Mot de passe</label><input type="password" id="prof-pwd" class="input-field mt-1" placeholder="Laisser vide si inchangé"></div>
+                        <div><label class="text-xs font-bold text-slate-400">Camping</label><select id="prof-camping" disabled class="input-field mt-1 disabled:bg-slate-100 disabled:text-slate-400"></select></div>
+                        <button onclick="saveProfileFull()" class="btn-primary py-3">Enregistrer les modifications</button>
+                    </div>
+                </div>
+                <button onclick="handleLogout()" class="w-full text-red-500 font-bold text-sm">Se déconnecter</button>
+            </div>
+
+        </main>
+
+        <!-- NAV BAR -->
+        <nav class="fixed bottom-6 left-4 right-4 bg-white/90 backdrop-blur-xl border border-white/20 shadow-float rounded-2xl h-16 flex justify-around items-center px-1 z-40 max-w-md mx-auto">
+            <button onclick="switchTab('dashboard')" class="nav-link text-tsa-red w-12" data-target="dashboard"><i class="fas fa-home text-lg"></i></button>
+            <button id="nav-stats" onclick="switchTab('stats')" class="nav-link text-slate-400 w-12 hidden" data-target="stats"><i class="fas fa-chart-pie text-lg"></i></button>
+            <button id="nav-hebdo" onclick="switchTab('hebdo')" class="nav-link text-slate-400 w-12 hidden" data-target="hebdo"><i class="fas fa-file-contract text-lg"></i></button>
+            <button id="nav-campings" onclick="switchTab('campings')" class="nav-link text-slate-400 w-12 hidden" data-target="campings"><i class="fas fa-campground text-lg"></i></button>
+            <button id="nav-users" onclick="switchTab('users')" class="nav-link text-slate-400 w-12 hidden" data-target="users"><i class="fas fa-users-cog text-lg"></i></button>
+            <button onclick="switchTab('profile')" class="nav-link text-slate-400 w-12" data-target="profile"><i class="fas fa-user text-lg"></i></button>
+        </nav>
+
+        <!-- MODAL REPORTING -->
+        <div id="modal-reporting" class="fixed inset-0 bg-slate-900/50 hidden flex items-end sm:items-center justify-center z-[70]">
+            <div class="bg-white w-full sm:w-[450px] rounded-t-3xl sm:rounded-3xl p-6 max-h-[90vh] overflow-y-auto animate-slide-up">
+               <h3 class="text-xl font-bold mb-4">Nouveau Reporting</h3>
+               <input type="text" id="rp-activity" placeholder="Activité" class="input-field mb-3">
+               <div class="grid grid-cols-2 gap-2 mb-3">
+                   <input type="date" id="rp-date" class="input-field">
+                   <div class="flex space-x-1"><input type="time" id="rp-start" class="input-field w-1/2"><input type="time" id="rp-end" class="input-field w-1/2"></div>
+               </div>
+               <div class="mb-4">
+                   <label class="text-xs font-bold text-slate-400 block mb-2">Type d'activité</label>
+                   <div class="flex flex-wrap gap-2" id="types-container">
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Enfant">Enfant</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Ado">Ado</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Adulte">Adulte</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Famille">Famille</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Jeux apéro">Jeux apéro</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Jeux café">Jeux café</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Mini Disco">Mini Disco</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Soirée">Soirée</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Concert">Concert</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Sortie extérieur">Sortie ext.</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Fitness">Fitness</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="AquaGym">AquaGym</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Sport">Sport</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Activité ludique">Ludique</span>
+                       <span onclick="toggleChip(this)" class="type-chip border px-3 py-1 rounded-full text-xs cursor-pointer" data-value="Autre">Autre</span>
+                   </div>
+               </div>
+               <div class="flex items-center space-x-2 mb-4">
+                   <button onclick="changeParticipants(-1)" class="w-10 h-10 border rounded flex items-center justify-center">-</button>
+                   <input type="number" id="rp-participants" placeholder="0" class="input-field text-center font-bold text-xl" value="0">
+                   <button onclick="changeParticipants(1)" class="w-10 h-10 border rounded flex items-center justify-center">+</button>
+               </div>
+               <button onclick="submitReporting()" class="btn-primary">Valider</button>
+               <button onclick="closeModal('modal-reporting')" class="w-full text-center text-sm text-slate-400 mt-2">Fermer</button>
+            </div>
+        </div>
+
+        <!-- MODAL CAMPING -->
+        <div id="modal-camping" class="fixed inset-0 bg-slate-900/50 hidden flex items-center justify-center z-[70] backdrop-blur-sm">
+            <div class="bg-white w-full max-w-sm mx-4 rounded-2xl p-6 shadow-2xl animate-slide-up">
+                <h3 class="text-lg font-bold mb-4">Gérer Camping</h3>
+                <form id="form-camping" class="space-y-3">
+                    <input type="hidden" id="camp-id">
+                    <input type="text" id="camp-name" placeholder="Nom *" required class="input-field">
+                    <input type="text" id="camp-director" placeholder="Directeur *" required class="input-field">
+                    <input type="tel" id="camp-phone" placeholder="Téléphone" class="input-field">
+                    <input type="text" id="camp-address" placeholder="Adresse" class="input-field">
+                    <input type="email" id="camp-email" placeholder="Email" class="input-field">
+                    <div class="flex justify-end space-x-2 mt-4">
+                        <button type="button" onclick="closeModal('modal-camping')" class="px-4 py-2 text-slate-500 font-bold">Annuler</button>
+                        <button type="button" onclick="saveCamping()" class="px-4 py-2 bg-slate-900 text-white rounded-lg font-bold">Sauvegarder</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+    </div>
+
+    <!-- STYLES -->
+    <style type="text/tailwindcss">
+        .input-field { @apply w-full border border-slate-200 rounded-xl p-3 bg-slate-50 outline-none focus:border-tsa-red focus:ring-1 focus:ring-tsa-red transition text-sm; }
+        .btn-primary { @apply w-full bg-slate-900 text-white font-bold py-3.5 rounded-xl shadow-lg hover:bg-slate-800 transition transform active:scale-[0.98]; }
+        .btn-secondary { @apply w-full bg-white border border-slate-200 text-slate-600 font-bold py-3.5 rounded-xl hover:bg-slate-50 transition; }
+        .btn-big-action { @apply w-full bg-slate-900 text-white h-16 rounded-2xl shadow-lg flex items-center justify-between px-6 hover:bg-slate-800 transition; }
+        .card-kpi { @apply bg-white p-5 rounded-2xl shadow-card border border-slate-100 cursor-pointer hover:shadow-md transition; }
+        .hidden { display: none !important; }
+        .type-chip.selected { @apply bg-tsa-red text-white border-transparent; }
+        .type-chip { @apply bg-white text-slate-600 border-slate-200 hover:border-slate-300 transition select-none; }
+    </style>
+</body>
+</html>
